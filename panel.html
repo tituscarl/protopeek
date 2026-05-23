@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Protopeek</title>
+    <link rel="stylesheet" href="panel.css">
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <header>
+          <h2>Captured calls</h2>
+          <button id="clear" title="Clear captured calls">clear</button>
+        </header>
+        <div id="search-bar">
+          <input id="search" type="search" placeholder="search method, url, or payload text">
+        </div>
+        <div id="schema-bar">
+          <button id="load-schema" title="Load a FileDescriptorSet (.binpb / .pb / .bin)">load schema</button>
+          <button id="clear-schema" title="Forget the loaded schema">forget</button>
+          <span id="schema-status">no schema</span>
+          <input id="schema-file" type="file" hidden>
+        </div>
+        <ul id="calls"></ul>
+        <footer id="hints">
+          <p>Calls fired before this panel opened are missed.</p>
+          <p>Load a FileDescriptorSet to see field names.</p>
+        </footer>
+      </aside>
+      <main id="detail">
+        <div class="placeholder">Select a call to inspect.</div>
+      </main>
+    </div>
+    <script src="panel.js"></script>
+  </body>
+</html>

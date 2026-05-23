@@ -1,0 +1,6 @@
+.DS_Store
+*.binpb
+*.crx
+*.zip
+.vscode/
+.idea/
