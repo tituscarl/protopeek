@@ -1,6 +1,7 @@
 "use strict";
 
 const calls = [];
+const liById = new Map();
 let nextId = 1;
 let selectedId = null;
 let detailToggles = {};
@@ -16,18 +17,30 @@ const schemaFileEl = document.getElementById("schema-file");
 
 document.getElementById("clear").addEventListener("click", () => {
   calls.length = 0;
+  liById.clear();
   selectedId = null;
   detailToggles = {};
   userCollapsed.clear();
   userExpanded.clear();
-  renderList();
+  callsEl.textContent = "";
   renderDetail();
 });
 
 const searchEl = document.getElementById("search");
+let searchDebounce = 0;
 searchEl.addEventListener("input", () => {
-  searchQuery = searchEl.value;
-  renderList();
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(() => {
+    searchQuery = searchEl.value;
+    applySearch();
+    renderDetail();
+  }, 50);
+});
+
+callsEl.addEventListener("click", (e) => {
+  const li = e.target.closest("li[data-id]");
+  if (!li || !callsEl.contains(li)) return;
+  setSelection(Number(li.dataset.id));
   renderDetail();
 });
 
@@ -94,7 +107,9 @@ function handleRequest(req) {
     resFrames: null,
     trailer: null,
     error: null,
+    _search: "",
   };
+  entry._search = (entry.method + "\n" + entry.url).toLowerCase();
 
   try {
     const postText = req.request.postData && req.request.postData.text;
@@ -102,13 +117,14 @@ function handleRequest(req) {
       let bytes = latin1ToBytes(postText);
       if (isText) bytes = maybeBase64Decode(bytes);
       entry.reqFrames = parseFrames(bytes);
+      appendFrameSearchText(entry, entry.reqFrames);
     }
   } catch (e) {
     entry.error = "request decode: " + e.message;
   }
 
   calls.push(entry);
-  renderList();
+  appendListItem(entry);
 
   req.getContent((content, encoding) => {
     try {
@@ -120,12 +136,25 @@ function handleRequest(req) {
       entry.resFrames = frames.filter((f) => !f.isTrailer);
       const trailer = frames.find((f) => f.isTrailer);
       if (trailer) entry.trailer = parseTrailer(trailer.payload);
+      appendFrameSearchText(entry, entry.resFrames);
+      if (entry.trailer && entry.trailer.raw) {
+        entry._search += "\n" + entry.trailer.raw.toLowerCase();
+      }
     } catch (e) {
       entry.error = (entry.error ? entry.error + "; " : "") + "response decode: " + e.message;
     }
+    refreshEntryVisibility(entry);
     if (selectedId === entry.id) renderDetail();
-    renderList();
   });
+}
+
+function appendFrameSearchText(entry, frames) {
+  if (!frames) return;
+  const dec = new TextDecoder("utf-8", { fatal: false });
+  for (const f of frames) {
+    try { entry._search += "\n" + dec.decode(f.payload).toLowerCase(); }
+    catch {}
+  }
 }
 
 function headerValue(headers, name) {
@@ -467,39 +496,48 @@ function formatDuration(ms) {
 
 function entryMatches(entry, q) {
   if (!q) return true;
-  const ql = q.toLowerCase();
-  if (entry.method.toLowerCase().includes(ql)) return true;
-  if (entry.url.toLowerCase().includes(ql)) return true;
-  for (const frames of [entry.reqFrames, entry.resFrames]) {
-    if (!frames) continue;
-    for (const f of frames) {
-      try {
-        const s = new TextDecoder("utf-8", { fatal: false }).decode(f.payload).toLowerCase();
-        if (s.includes(ql)) return true;
-      } catch {}
-    }
-  }
-  if (entry.trailer && entry.trailer.raw && entry.trailer.raw.toLowerCase().includes(ql)) return true;
-  return false;
+  return entry._search.includes(q.toLowerCase());
 }
 
-function renderList() {
-  callsEl.innerHTML = "";
+function listItemHtml(entry) {
+  const statusClass = entry.status >= 200 && entry.status < 400 ? "status-ok" : "status-bad";
+  return `<div class="method">${hl(entry.method)}</div>` +
+         `<div class="meta"><span class="${statusClass}">HTTP ${entry.status}</span> · ${formatDuration(entry.timeMs)}</div>`;
+}
+
+function appendListItem(entry) {
+  const li = document.createElement("li");
+  li.dataset.id = String(entry.id);
+  if (entry.id === selectedId) li.classList.add("selected");
+  li.innerHTML = listItemHtml(entry);
+  if (searchQuery && !entryMatches(entry, searchQuery)) li.hidden = true;
+  liById.set(entry.id, li);
+  callsEl.appendChild(li);
+}
+
+function applySearch() {
   for (const entry of calls) {
-    if (!entryMatches(entry, searchQuery)) continue;
-    const li = document.createElement("li");
-    if (entry.id === selectedId) li.classList.add("selected");
-    const statusClass = entry.status >= 200 && entry.status < 400 ? "status-ok" : "status-bad";
-    li.innerHTML =
-      `<div class="method">${hl(entry.method)}</div>` +
-      `<div class="meta"><span class="${statusClass}">HTTP ${entry.status}</span> · ${formatDuration(entry.timeMs)}</div>`;
-    li.addEventListener("click", () => {
-      selectedId = entry.id;
-      renderList();
-      renderDetail();
-    });
-    callsEl.appendChild(li);
+    const li = liById.get(entry.id);
+    if (!li) continue;
+    const matches = !searchQuery || entryMatches(entry, searchQuery);
+    li.hidden = !matches;
+    if (matches) li.innerHTML = listItemHtml(entry);
   }
+}
+
+function refreshEntryVisibility(entry) {
+  const li = liById.get(entry.id);
+  if (!li) return;
+  li.hidden = searchQuery ? !entryMatches(entry, searchQuery) : false;
+}
+
+function setSelection(id) {
+  if (selectedId === id) return;
+  const prev = liById.get(selectedId);
+  if (prev) prev.classList.remove("selected");
+  selectedId = id;
+  const next = liById.get(id);
+  if (next) next.classList.add("selected");
 }
 
 function renderDetail() {
@@ -541,17 +579,47 @@ function renderDetail() {
   }
 
   detailEl.innerHTML = parts.join("");
-  attachToggleHandlers();
-  attachDetailsHandlers();
+}
+
+detailEl.addEventListener("click", (e) => {
+  const t = e.target.closest && e.target.closest(".toggle");
+  if (!t || !detailEl.contains(t)) return;
+  e.stopPropagation();
+  e.preventDefault();
+  const k = t.getAttribute("data-key");
+  const to = t.getAttribute("data-to");
+  if (to === "") delete detailToggles[k];
+  else detailToggles[k] = to;
+  renderDetail();
+});
+
+// `toggle` does not bubble — listen in the capture phase to delegate.
+detailEl.addEventListener("toggle", (e) => {
+  const el = e.target;
+  if (!el || el.tagName !== "DETAILS") return;
+  const k = el.getAttribute("data-key");
+  if (!k) return;
+  const defaultClosed = el.getAttribute("data-default") === "closed";
+  if (defaultClosed) {
+    if (el.open) userExpanded.add(k); else userExpanded.delete(k);
+  } else {
+    if (el.open) userCollapsed.delete(k); else userCollapsed.add(k);
+  }
+}, true);
+
+function decodedFields(frame) {
+  if (frame._fields === undefined) {
+    try { frame._fields = decodeMessage(frame.payload, false) || []; }
+    catch { frame._fields = []; }
+  }
+  return frame._fields;
 }
 
 function renderFrames(frames, kind, messageDef) {
   if (frames == null) return '<div class="placeholder" style="padding:8px">(no body captured)</div>';
   if (frames.length === 0) return '<div class="placeholder" style="padding:8px">(empty)</div>';
   return frames.map((f, idx) => {
-    let fields;
-    try { fields = decodeMessage(f.payload, false) || []; }
-    catch (e) { fields = []; }
+    const fields = decodedFields(f);
     const frameKey = `${kind}-${idx}-frame`;
     return (
       `<details class="frame" ${detailsOpen(frameKey, false)} data-key="${escapeHtml(frameKey)}" data-default="closed">` +
@@ -578,9 +646,20 @@ function s64ToSigned(u) { // BigInt unsigned 64 -> signed
   return u >= (1n << 63n) ? u - (1n << 64n) : u;
 }
 
+const defByNumCache = new WeakMap();
+function defByNumFor(messageDef) {
+  if (!messageDef) return null;
+  let m = defByNumCache.get(messageDef);
+  if (!m) {
+    m = new Map(messageDef.fields.map((d) => [d.number, d]));
+    defByNumCache.set(messageDef, m);
+  }
+  return m;
+}
+
 function renderFields(fields, path, crumbs, messageDef) {
   if (!fields || fields.length === 0) return '<li class="field-type">(empty)</li>';
-  const defByNum = messageDef ? new Map(messageDef.fields.map((d) => [d.number, d])) : null;
+  const defByNum = defByNumFor(messageDef);
 
   return fields.map((f, idx) => {
     const myCrumbs = crumbs.concat(idx);
@@ -711,37 +790,6 @@ function toggleLinks(key, alts) {
   ).join("");
 }
 
-function attachToggleHandlers() {
-  for (const el of detailEl.querySelectorAll(".toggle")) {
-    el.addEventListener("click", (e) => {
-      e.stopPropagation();
-      e.preventDefault();
-      const k = el.getAttribute("data-key");
-      const to = el.getAttribute("data-to");
-      if (to === "") delete detailToggles[k];
-      else detailToggles[k] = to;
-      renderDetail();
-    });
-  }
-}
-
-function attachDetailsHandlers() {
-  for (const el of detailEl.querySelectorAll("details[data-key]")) {
-    el.addEventListener("toggle", () => {
-      const k = el.getAttribute("data-key");
-      const defaultClosed = el.getAttribute("data-default") === "closed";
-      if (defaultClosed) {
-        if (el.open) userExpanded.add(k);
-        else userExpanded.delete(k);
-      } else {
-        if (el.open) userCollapsed.delete(k);
-        else userCollapsed.add(k);
-      }
-    });
-  }
-}
-
-renderList();
 renderDetail();
 
 chrome.storage.local.get("schemaB64", (data) => {
