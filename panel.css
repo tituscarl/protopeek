@@ -5,6 +5,7 @@ html, body {
   height: 100%;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 12px;
+  line-height: 1.45;
   color: #1f2328;
   background: #ffffff;
 }
@@ -16,11 +17,31 @@ html, body {
 
 #sidebar {
   width: 340px;
-  border-right: 1px solid #d0d7de;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
   background: #f6f8fa;
 }
+
+/* Draggable divider between the call list and the detail pane. The 1px line
+   matches the old border; the ::after widens the grab target without nudging
+   the layout. */
+#resizer {
+  flex: 0 0 1px;
+  background: #d0d7de;
+  position: relative;
+  cursor: col-resize;
+}
+#resizer::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -2px;
+  right: -4px;
+}
+#resizer:hover,
+#resizer.dragging { background: #0969da; }
 
 #sidebar header {
   display: flex;
@@ -128,10 +149,11 @@ mark {
   font-family: ui-monospace, Menlo, Consolas, monospace;
 }
 #calls li:hover { background: #eaeef2; }
-#calls li.selected { background: #ddf4ff; }
+#calls li.selected { background: #ddf4ff; box-shadow: inset 2px 0 0 #0969da; }
 
 #calls .method { font-weight: 600; color: #0969da; word-break: break-all; }
-#calls .meta { font-size: 10.5px; color: #57606a; margin-top: 2px; }
+#calls .meta { font-size: 10.5px; color: #57606a; margin-top: 2px; font-variant-numeric: tabular-nums; }
+#calls .seq { color: #8c959f; }
 #calls .status-ok { color: #1a7f37; }
 #calls .status-bad { color: #cf222e; }
 
@@ -175,6 +197,11 @@ mark {
   margin-bottom: 18px;
 }
 
+#detail section + section {
+  border-top: 1px solid #d0d7de;
+  padding-top: 16px;
+}
+
 #detail section > h3 {
   font-size: 11px;
   margin: 0 0 6px 0;
@@ -193,8 +220,8 @@ mark {
 }
 
 .frame-hdr {
-  padding: 4px 10px;
-  font-size: 10.5px;
+  padding: 5px 10px;
+  font-size: 11px;
   color: #57606a;
   background: #eaeef2;
   border-top-left-radius: 6px;
@@ -235,7 +262,7 @@ details.frame > summary.frame-hdr:hover { background: #dde3eb; }
 }
 
 .fields li {
-  padding: 1px 0 1px 14px;
+  padding: 2px 0 2px 16px;
   position: relative;
   white-space: pre-wrap;
   word-break: break-all;
@@ -243,8 +270,8 @@ details.frame > summary.frame-hdr:hover { background: #dde3eb; }
 
 .fields ul {
   list-style: none;
-  padding-left: 16px;
-  border-left: 1px dashed #d0d7de;
+  padding-left: 18px;
+  border-left: 1px solid #d8dee4;
   margin: 2px 0;
 }
 
@@ -275,11 +302,11 @@ details.frame > summary.frame-hdr:hover { background: #dde3eb; }
 
 .field-tag {
   color: #8250df;
-  font-weight: 600;
+  font-weight: 500;
 }
 .field-type {
-  color: #6e7781;
-  font-size: 10.5px;
+  color: #57606a;
+  font-size: 11px;
 }
 .field-val-str { color: #1a7f37; }
 .field-val-num { color: #0550ae; }
@@ -291,8 +318,12 @@ details.frame > summary.frame-hdr:hover { background: #dde3eb; }
   font-size: 10.5px;
   margin-left: 6px;
   user-select: none;
+  opacity: 0.6;
+  transition: opacity 0.1s ease;
 }
-.toggle:hover { text-decoration: underline; }
+.fields li:hover > .toggle,
+.fields summary:hover > .toggle { opacity: 1; }
+.toggle:hover { text-decoration: underline; opacity: 1; }
 
 .trailer {
   background: #fff8c5;
@@ -307,9 +338,18 @@ details.frame > summary.frame-hdr:hover { background: #dde3eb; }
   font-family: inherit;
 }
 
+.trailer pre {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font: inherit;
+}
+
 @media (prefers-color-scheme: dark) {
   html, body { color: #e6edf3; background: #0d1117; }
-  #sidebar { background: #161b22; border-right-color: #30363d; }
+  #sidebar { background: #161b22; }
+  #resizer { background: #30363d; }
+  #resizer:hover, #resizer.dragging { background: #58a6ff; }
   #sidebar header, #hints, .frame-hdr { border-color: #30363d; }
   #sidebar header h2, #sidebar header button, #hints, .field-type, #calls .meta {
     color: #8b949e;
@@ -318,7 +358,9 @@ details.frame > summary.frame-hdr:hover { background: #dde3eb; }
   #sidebar header button:hover { background: #30363d; }
   #calls li { border-bottom-color: #21262d; }
   #calls li:hover { background: #21262d; }
-  #calls li.selected { background: #1f6feb33; }
+  #calls li.selected { background: #1f6feb26; box-shadow: inset 2px 0 0 #58a6ff; }
+  #calls .seq { color: #6e7781; }
+  #detail section + section { border-top-color: #30363d; }
   #calls .method { color: #58a6ff; }
   #calls .status-ok { color: #3fb950; }
   #calls .status-bad { color: #f85149; }
@@ -329,7 +371,7 @@ details.frame > summary.frame-hdr:hover { background: #dde3eb; }
   details.frame[open] > .frame-hdr { border-bottom-color: #30363d; }
   details.frame > summary.frame-hdr::before { color: #8b949e; }
   details.frame > summary.frame-hdr:hover { background: #2d333b; }
-  .fields ul { border-left-color: #30363d; }
+  .fields ul { border-left-color: #373e47; }
   .fields details > summary::before { color: #8b949e; }
   .fields details > summary:hover::before { color: #58a6ff; }
   .field-tag { color: #d2a8ff; }
@@ -342,7 +384,7 @@ details.frame > summary.frame-hdr:hover { background: #dde3eb; }
   #search-bar { border-bottom-color: #30363d; }
   #search { background: #0d1117; border-color: #30363d; color: #e6edf3; }
   #search:focus { border-color: #58a6ff; box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2); }
-  mark { background: #9e6a03; color: #ffffff; }
+  mark { background: rgba(210, 153, 34, 0.4); color: inherit; }
   #schema-bar button { background: #21262d; border-color: #30363d; color: #8b949e; }
   #schema-bar button:hover { background: #30363d; }
   #schema-status { color: #8b949e; }

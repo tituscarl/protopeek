@@ -10,6 +10,24 @@ const userExpanded = new Set();  // overrides default-closed
 let searchQuery = "";
 let schema = null; // { messages: Map<fqn, MessageDef>, enums: Map<fqn, EnumDef>, methods: Map<path, {inputType, outputType}> }
 
+// Render-time registry of frame bodies whose decode + HTML build is deferred
+// until the frame is expanded. Rebuilt on every renderDetail().
+const lazyBodies = new Map();
+
+// Cap on how much payload text we index for search, per call. Decoding whole
+// multi-MB payloads to a searchable string on capture is what made bursts of
+// large calls crawl, so we bound it and build it lazily (see payloadSearchText).
+const SEARCH_TEXT_CAP = 256 * 1024;
+
+// Nested messages up to this depth render expanded; deeper levels render
+// collapsed and decode on expand, so opening one frame can't cascade an
+// arbitrarily deep tree into the DOM at once.
+const AUTO_OPEN_DEPTH = 2;
+
+// Keep only the most recent N calls. Past this, the oldest are evicted so a
+// long-running session under heavy traffic doesn't grow memory/DOM unbounded.
+const MAX_CALLS = 500;
+
 const callsEl = document.getElementById("calls");
 const detailEl = document.getElementById("detail");
 const schemaStatusEl = document.getElementById("schema-status");
@@ -35,6 +53,50 @@ searchEl.addEventListener("input", () => {
     applySearch();
     renderDetail();
   }, 50);
+});
+
+// ---------- Resizable call list ----------
+
+const sidebarEl = document.getElementById("sidebar");
+const resizerEl = document.getElementById("resizer");
+const MIN_SIDEBAR = 200;
+
+function setSidebarWidth(px) {
+  // Always leave room for the detail pane, even on a narrow window.
+  const max = Math.max(MIN_SIDEBAR, window.innerWidth - 260);
+  const w = Math.max(MIN_SIDEBAR, Math.min(max, px));
+  sidebarEl.style.width = w + "px";
+  return w;
+}
+
+resizerEl.addEventListener("mousedown", (e) => {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startWidth = sidebarEl.getBoundingClientRect().width;
+  resizerEl.classList.add("dragging");
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+
+  const onMove = (ev) => setSidebarWidth(startWidth + (ev.clientX - startX));
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+    resizerEl.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+    chrome.storage.local.set({ sidebarWidth: sidebarEl.getBoundingClientRect().width });
+  };
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+});
+
+// Re-clamp if the window shrinks so the detail pane never gets squeezed away.
+window.addEventListener("resize", () => {
+  if (sidebarEl.style.width) setSidebarWidth(parseFloat(sidebarEl.style.width));
+});
+
+chrome.storage.local.get("sidebarWidth", (data) => {
+  if (data && typeof data.sidebarWidth === "number") setSidebarWidth(data.sidebarWidth);
 });
 
 callsEl.addEventListener("click", (e) => {
@@ -103,11 +165,14 @@ function handleRequest(req) {
     status: req.response.status,
     statusText: req.response.statusText,
     timeMs: Math.round(req.time || 0),
+    startedLabel: formatClock(req.startedDateTime),
+    grpcStatus: undefined, // filled from the trailer once the response arrives
     reqFrames: null,
     resFrames: null,
     trailer: null,
     error: null,
     _search: "",
+    _payloadText: null, // lazily-built, capped payload index (see payloadSearchText)
   };
   entry._search = (entry.method + "\n" + entry.url).toLowerCase();
 
@@ -117,7 +182,6 @@ function handleRequest(req) {
       let bytes = latin1ToBytes(postText);
       if (isText) bytes = maybeBase64Decode(bytes);
       entry.reqFrames = parseFrames(bytes);
-      appendFrameSearchText(entry, entry.reqFrames);
     }
   } catch (e) {
     entry.error = "request decode: " + e.message;
@@ -125,6 +189,7 @@ function handleRequest(req) {
 
   calls.push(entry);
   appendListItem(entry);
+  evictOverflow();
 
   req.getContent((content, encoding) => {
     try {
@@ -136,7 +201,8 @@ function handleRequest(req) {
       entry.resFrames = frames.filter((f) => !f.isTrailer);
       const trailer = frames.find((f) => f.isTrailer);
       if (trailer) entry.trailer = parseTrailer(trailer.payload);
-      appendFrameSearchText(entry, entry.resFrames);
+      entry.grpcStatus = entry.trailer ? entry.trailer.headers["grpc-status"] : undefined;
+      entry._payloadText = null; // response frames changed; drop any cached index
       if (entry.trailer && entry.trailer.raw) {
         entry._search += "\n" + entry.trailer.raw.toLowerCase();
       }
@@ -148,13 +214,25 @@ function handleRequest(req) {
   });
 }
 
-function appendFrameSearchText(entry, frames) {
-  if (!frames) return;
+// Build (once) the searchable payload text for a call, capped at SEARCH_TEXT_CAP.
+// Only called when there's an actual query, so calls that are never searched
+// never pay the decode cost. Invalidated by setting entry._payloadText = null.
+function payloadSearchText(entry) {
+  if (entry._payloadText != null) return entry._payloadText;
   const dec = new TextDecoder("utf-8", { fatal: false });
-  for (const f of frames) {
-    try { entry._search += "\n" + dec.decode(f.payload).toLowerCase(); }
-    catch {}
+  let text = "";
+  for (const frames of [entry.reqFrames, entry.resFrames]) {
+    if (!frames) continue;
+    for (const f of frames) {
+      const remaining = SEARCH_TEXT_CAP - text.length;
+      if (remaining <= 0) break;
+      const slice = f.payload.length > remaining ? f.payload.subarray(0, remaining) : f.payload;
+      try { text += dec.decode(slice) + "\n"; } catch {}
+    }
+    if (text.length >= SEARCH_TEXT_CAP) break;
   }
+  entry._payloadText = text.toLowerCase();
+  return entry._payloadText;
 }
 
 function headerValue(headers, name) {
@@ -271,19 +349,24 @@ function decodeMessage(buf, strict) {
       if (L < 0 || i + L > buf.length) return strict ? null : out;
       const slice = buf.subarray(i, i + L);
       i += L;
-      const nested = slice.length > 0 ? decodeMessage(slice, true) : null;
-      const nestedOk = nested && nested.length > 0;
-      const stringVal = !nestedOk ? tryString(slice) : null;
-      out.push({
-        fieldNumber,
-        wireType,
-        bytes: slice,
-        nested: nestedOk ? nested : null,
-        stringVal,
-      });
+      // Store the raw slice only. Whether it's a nested message, a string, or
+      // opaque bytes is decided lazily at render time (classifyField) so one
+      // decodeMessage call costs O(this level) instead of O(whole subtree).
+      out.push({ fieldNumber, wireType, bytes: slice });
     }
   }
   return out;
+}
+
+// Decide, on demand, how a length-delimited field should be shown: nested
+// message, printable string, or opaque bytes. Result is cached on the field so
+// re-renders are free. The strict decode probes only one level deep (see
+// decodeMessage), so this never walks the whole subtree at once.
+function classifyField(f) {
+  if (f._nested !== undefined) return;
+  const nested = f.bytes && f.bytes.length > 0 ? decodeMessage(f.bytes, true) : null;
+  f._nested = nested && nested.length > 0 ? nested : null;
+  f._stringVal = f._nested ? null : tryString(f.bytes);
 }
 
 function tryString(buf) {
@@ -339,7 +422,7 @@ function getF(fields, num) { return fields.find((f) => f.fieldNumber === num); }
 function getAllF(fields, num) { return fields.filter((f) => f.fieldNumber === num); }
 function asString(f) {
   if (!f) return null;
-  return f.stringVal != null ? f.stringVal : new TextDecoder("utf-8").decode(f.bytes);
+  return new TextDecoder("utf-8").decode(f.bytes);
 }
 function asMessage(f) {
   if (!f) return [];
@@ -494,15 +577,33 @@ function formatDuration(ms) {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
+// Wall-clock HH:MM:SS from the request's HAR start time, so rows fired against
+// the same method path stay tellable apart. Falls back to capture time.
+function formatClock(iso) {
+  const d = iso ? new Date(iso) : new Date();
+  if (isNaN(d.getTime())) return "";
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function entryMatches(entry, q) {
   if (!q) return true;
-  return entry._search.includes(q.toLowerCase());
+  const ql = q.toLowerCase();
+  // Cheap method/url/trailer index first; only decode payload text if needed.
+  if (entry._search.includes(ql)) return true;
+  return payloadSearchText(entry).includes(ql);
 }
 
 function listItemHtml(entry) {
-  const statusClass = entry.status >= 200 && entry.status < 400 ? "status-ok" : "status-bad";
+  const httpClass = entry.status >= 200 && entry.status < 400 ? "status-ok" : "status-bad";
+  // A 200 with grpc-status != 0 is a failed RPC — surface it so the row doesn't
+  // read as green/OK. grpc-status is only known once the trailer is parsed.
+  const grpcBad = entry.grpcStatus != null && entry.grpcStatus !== "0";
+  const grpcBadge = grpcBad ? ` · <span class="status-bad">gRPC ${hl(entry.grpcStatus)}</span>` : "";
+  const time = entry.startedLabel ? `${entry.startedLabel} · ` : "";
   return `<div class="method">${hl(entry.method)}</div>` +
-         `<div class="meta"><span class="${statusClass}">HTTP ${entry.status}</span> · ${formatDuration(entry.timeMs)}</div>`;
+         `<div class="meta"><span class="seq">#${entry.id}</span> · ${time}` +
+         `<span class="${httpClass}">HTTP ${entry.status}</span>${grpcBadge} · ${formatDuration(entry.timeMs)}</div>`;
 }
 
 function appendListItem(entry) {
@@ -513,6 +614,22 @@ function appendListItem(entry) {
   if (searchQuery && !entryMatches(entry, searchQuery)) li.hidden = true;
   liById.set(entry.id, li);
   callsEl.appendChild(li);
+}
+
+// Drop the oldest calls once we exceed MAX_CALLS, releasing their frames/DOM.
+// Late getContent callbacks for an evicted entry are harmless: liById no longer
+// has its row, so the visibility/detail refreshes simply no-op.
+function evictOverflow() {
+  while (calls.length > MAX_CALLS) {
+    const old = calls.shift();
+    const li = liById.get(old.id);
+    if (li) li.remove();
+    liById.delete(old.id);
+    if (selectedId === old.id) {
+      selectedId = null;
+      renderDetail();
+    }
+  }
 }
 
 function applySearch() {
@@ -528,6 +645,8 @@ function applySearch() {
 function refreshEntryVisibility(entry) {
   const li = liById.get(entry.id);
   if (!li) return;
+  // The response just arrived, so grpc-status / duration may now be known.
+  li.innerHTML = listItemHtml(entry);
   li.hidden = searchQuery ? !entryMatches(entry, searchQuery) : false;
 }
 
@@ -541,6 +660,7 @@ function setSelection(id) {
 }
 
 function renderDetail() {
+  lazyBodies.clear();
   const entry = calls.find((c) => c.id === selectedId);
   if (!entry) {
     detailEl.innerHTML = '<div class="placeholder">Select a call to inspect.</div>';
@@ -605,6 +725,17 @@ detailEl.addEventListener("toggle", (e) => {
   } else {
     if (el.open) userCollapsed.delete(k); else userCollapsed.add(k);
   }
+
+  // First expand of a deferred node (frame or deep nested message): decode and
+  // build its body now and inject it.
+  const lazyKey = el.getAttribute("data-lazy");
+  if (lazyKey && el.open) {
+    const build = lazyBodies.get(lazyKey);
+    if (build) {
+      el.insertAdjacentHTML("beforeend", build());
+      lazyBodies.delete(lazyKey);
+    }
+  }
 }, true);
 
 function decodedFields(frame) {
@@ -619,14 +750,26 @@ function renderFrames(frames, kind, messageDef) {
   if (frames == null) return '<div class="placeholder" style="padding:8px">(no body captured)</div>';
   if (frames.length === 0) return '<div class="placeholder" style="padding:8px">(empty)</div>';
   return frames.map((f, idx) => {
-    const fields = decodedFields(f);
     const frameKey = `${kind}-${idx}-frame`;
-    return (
-      `<details class="frame" ${detailsOpen(frameKey, false)} data-key="${escapeHtml(frameKey)}" data-default="closed">` +
-      `<summary class="frame-hdr">data frame #${idx} · ${f.payload.length} B · flag 0x${f.flag.toString(16).padStart(2, "0")}${messageDef ? ` · <span class="field-name">${hl(messageDef.name)}</span>` : ""}</summary>` +
-      `<div class="frame-body"><ul class="fields">${renderFields(fields, `${kind}-${idx}`, [], messageDef)}</ul></div>` +
-      `</details>`
-    );
+    const flagHex = f.flag.toString(16).padStart(2, "0");
+    const summary =
+      `<summary class="frame-hdr">data frame #${idx} · ${f.payload.length} B · flag 0x${flagHex}` +
+      `${messageDef ? ` · <span class="field-name">${hl(messageDef.name)}</span>` : ""}</summary>`;
+    // Decode the wire format and build the field tree only when actually shown.
+    const renderBody = () =>
+      `<div class="frame-body"><ul class="fields">` +
+      `${renderFields(decodedFields(f), `${kind}-${idx}`, [], messageDef)}</ul></div>`;
+
+    if (detailsOpen(frameKey, false) === "open" || bytesContainQuery(f.payload)) {
+      return `<details class="frame" open data-key="${escapeHtml(frameKey)}" data-default="closed">` +
+             summary + renderBody() + `</details>`;
+    }
+    // Collapsed: emit only the summary and defer the body until expanded. This
+    // is what keeps a burst of large calls cheap — nothing under a closed frame
+    // is decoded or turned into DOM.
+    lazyBodies.set(frameKey, renderBody);
+    return `<details class="frame" data-key="${escapeHtml(frameKey)}" data-default="closed" data-lazy="${escapeHtml(frameKey)}">` +
+           summary + `</details>`;
   }).join("");
 }
 
@@ -657,7 +800,7 @@ function defByNumFor(messageDef) {
   return m;
 }
 
-function renderFields(fields, path, crumbs, messageDef) {
+function renderFields(fields, path, crumbs, messageDef, depth = 0) {
   if (!fields || fields.length === 0) return '<li class="field-type">(empty)</li>';
   const defByNum = defByNumFor(messageDef);
 
@@ -675,8 +818,25 @@ function renderFields(fields, path, crumbs, messageDef) {
     if (f.wireType === 5) return renderFixed(tagHtml, f, def, 32);
 
     // wireType 2 — length-delimited
-    return renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs);
+    return renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs, depth);
   }).join("");
+}
+
+// Render a collapsible nested-message node. Its children are produced by
+// childThunk() only when the node is open — collapsed deep nodes register the
+// thunk in lazyBodies and emit just the summary, so the toggle handler can
+// build the subtree on first expand (mirrors the frame-level laziness).
+function renderMessageNode(tagHtml, summaryRest, key, childThunk, depth, matchHit) {
+  const autoOpen = depth < AUTO_OPEN_DEPTH;
+  const dataDefault = autoOpen ? "open" : "closed";
+  const summary = `<summary>${tagHtml} ${summaryRest}</summary>`;
+  if (detailsOpen(key, autoOpen) === "open" || matchHit) {
+    return `<li><details open data-key="${escapeHtml(key)}" data-default="${dataDefault}">` +
+           `${summary}<ul>${childThunk()}</ul></details></li>`;
+  }
+  lazyBodies.set(key, () => `<ul>${childThunk()}</ul>`);
+  return `<li><details data-key="${escapeHtml(key)}" data-default="${dataDefault}" data-lazy="${escapeHtml(key)}">` +
+         `${summary}</details></li>`;
 }
 
 function renderVarint(tagHtml, f, def) {
@@ -732,12 +892,27 @@ function renderFixed(tagHtml, f, def, bits) {
 }
 
 function detailsOpen(key, defaultOpen = true) {
-  if (searchQuery) return "open";
   if (defaultOpen) return userCollapsed.has(key) ? "" : "open";
   return userExpanded.has(key) ? "open" : "";
 }
 
-function renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs) {
+// During search we no longer blindly force every node open (that re-materialized
+// the whole tree on each keystroke and defeated lazy rendering). Instead a node
+// auto-opens only when its own bytes contain the query, so just the matching
+// branches — plus their siblings at each open level — get decoded and rendered.
+function bytesContainQuery(bytes) {
+  if (!searchQuery || !bytes || bytes.length === 0) return false;
+  const cap = 64 * 1024;
+  const slice = bytes.length > cap ? bytes.subarray(0, cap) : bytes;
+  try {
+    return new TextDecoder("utf-8", { fatal: false }).decode(slice).toLowerCase()
+      .includes(searchQuery.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs, depth) {
   // Schema knows what this is
   if (def) {
     if (def.type === PB_TYPE.STRING) {
@@ -749,44 +924,55 @@ function renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs) {
     }
     if (def.type === PB_TYPE.MESSAGE || def.type === PB_TYPE.GROUP) {
       const subDef = schema && schema.messages.get(def.typeName);
-      const nested = decodeMessage(f.bytes, false) || [];
       const typeName = subDef ? subDef.name : (def.typeName || "message").replace(/^\./, "");
       const label = `<span class="field-type">(${hl(typeName)}, ${f.bytes.length} B)</span>`;
-      return `<li><details ${detailsOpen(key)} data-key="${escapeHtml(key)}" data-default="open"><summary>${tagHtml} ${label}</summary><ul>${renderFields(nested, path, myCrumbs, subDef)}</ul></details></li>`;
+      // Decode the sub-message only when this node is actually shown.
+      return renderMessageNode(tagHtml, label, key,
+        () => renderFields(decodeMessage(f.bytes, false) || [], path, myCrumbs, subDef, depth + 1),
+        depth, bytesContainQuery(f.bytes));
     }
     return `<li>${tagHtml} <span class="field-type">(${typeLabel(def.type)} packed?, ${f.bytes.length} B)</span> = <span class="field-val-hex">${bytesToHex(f.bytes, 64)}</span></li>`;
   }
 
   // Schema-less fallback (heuristic with toggles)
+  classifyField(f);
   const showRaw = detailToggles[key] === "raw";
   const showStr = detailToggles[key] === "str";
 
-  if (f.nested && !showRaw && !showStr) {
+  if (f._nested && !showRaw && !showStr) {
     const label = `<span class="field-type">(message, ${f.bytes.length} B)</span>`;
     const toggles = toggleLinks(key, ["str", "raw"]);
-    return `<li><details ${detailsOpen(key)} data-key="${escapeHtml(key)}" data-default="open"><summary>${tagHtml} ${label}${toggles}</summary><ul>${renderFields(f.nested, path, myCrumbs, null)}</ul></details></li>`;
+    return renderMessageNode(tagHtml, label + toggles, key,
+      () => renderFields(f._nested, path, myCrumbs, null, depth + 1),
+      depth, bytesContainQuery(f.bytes));
   }
 
   let label, body, toggles;
-  if (f.stringVal !== null && !showRaw) {
+  if (f._stringVal !== null && !showRaw) {
     label = `<span class="field-type">(string, ${f.bytes.length} B)</span>`;
-    body = ` = <span class="field-val-str">${hl(JSON.stringify(f.stringVal))}</span>`;
-    toggles = toggleLinks(key, f.nested ? ["msg", "raw"] : ["raw"]);
+    body = ` = <span class="field-val-str">${hl(JSON.stringify(f._stringVal))}</span>`;
+    toggles = toggleLinks(key, f._nested ? ["msg", "raw"] : ["raw"]);
   } else {
     label = `<span class="field-type">(bytes, ${f.bytes.length} B)</span>`;
     body = ` = <span class="field-val-hex">${bytesToHex(f.bytes, 48)}</span>`;
     const alts = [];
-    if (f.nested) alts.push("msg");
-    if (f.stringVal !== null) alts.push("str");
+    if (f._nested) alts.push("msg");
+    if (f._stringVal !== null) alts.push("str");
     toggles = toggleLinks(key, alts);
   }
   return `<li>${tagHtml} ${label}${toggles}${body}</li>`;
 }
 
+const TOGGLE_TITLES = {
+  msg: "decode as a nested message",
+  str: "interpret bytes as a UTF-8 string",
+  raw: "show raw bytes as hex",
+};
+
 function toggleLinks(key, alts) {
   if (alts.length === 0) return "";
   return alts.map((a) =>
-    `<span class="toggle" data-key="${escapeHtml(key)}" data-to="${a === "msg" ? "" : a}">[${a}]</span>`
+    `<span class="toggle" title="${escapeHtml(TOGGLE_TITLES[a] || "")}" data-key="${escapeHtml(key)}" data-to="${a === "msg" ? "" : a}">[${a}]</span>`
   ).join("");
 }
 
