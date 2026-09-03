@@ -8,29 +8,34 @@
   <body>
     <div id="app">
       <aside id="sidebar">
-        <header>
-          <h2>Captured calls</h2>
-          <button id="clear" title="Clear captured calls">clear</button>
-        </header>
-        <div id="search-bar">
-          <input id="search" type="search" placeholder="search method, url, or payload text">
-        </div>
-        <div id="schema-bar">
-          <button id="load-schema" title="Load a FileDescriptorSet (.binpb / .pb / .bin)">load schema</button>
-          <button id="clear-schema" title="Forget the loaded schema">forget</button>
-          <span id="schema-status">no schema</span>
+        <div id="toolbar">
+          <input id="search" type="search" placeholder="Filter calls"
+                 title="Filter the call list — Focus: Cmd/Ctrl+Shift+F">
+          <button id="load-schema" class="chip" title="Load a FileDescriptorSet (.binpb / .pb / .bin) — click, or drop the file anywhere on the panel">no schema</button>
+          <button id="clear-schema" class="icon-btn" title="Forget the loaded schema" hidden>×</button>
+          <button id="clear" class="icon-btn" title="Clear captured calls">⊘</button>
+          <button id="theme" title="Theme: auto — click to cycle">auto</button>
           <input id="schema-file" type="file" hidden>
         </div>
-        <ul id="calls"></ul>
-        <footer id="hints">
-          <p>Calls fired before this panel opened are missed.</p>
-          <p>Load a FileDescriptorSet to see field names.</p>
-          <p>Only the most recent 500 calls are kept.</p>
-        </footer>
+        <div id="list-count"></div>
+        <ul id="calls" role="listbox" aria-label="Captured gRPC-Web calls"></ul>
+        <div id="empty">
+          <div class="empty-title">Recording gRPC-Web traffic…</div>
+          <p>Reload the page to capture calls that fired before this panel opened.</p>
+          <p>Load a schema to see field names: <code>buf build -o schema.binpb</code>, then drop the file anywhere here.</p>
+          <p class="empty-faint">Only the most recent 500 calls are kept.</p>
+        </div>
       </aside>
       <div id="resizer" title="Drag to resize the call list"></div>
-      <main id="detail">
-        <div class="placeholder">Select a call to inspect.</div>
+      <main id="detail-pane">
+        <div id="detail-toolbar">
+          <input id="detail-search" type="search" placeholder="Search in call"
+                 title="Search inside the selected call — Focus: Cmd/Ctrl+F · Enter / Shift+Enter: next / previous match">
+          <div id="match-count"></div>
+        </div>
+        <div id="detail">
+          <div class="placeholder">Select a call to inspect.</div>
+        </div>
       </main>
     </div>
     <script src="panel.js"></script>

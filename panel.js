@@ -7,17 +7,18 @@ let selectedId = null;
 let detailToggles = {};
 const userCollapsed = new Set(); // overrides default-open
 const userExpanded = new Set();  // overrides default-closed
-let searchQuery = "";
+let expandGen = 0;               // bumped on every render / click to cancel an in-flight expand-all pump
+let searchQuery = ""; // content search: inside the selected call
+let listQuery = "";   // call filter: which rows the sidebar shows
+let searchText = "";     // decoded search text of the selected call (see payloadSearchText)
+let searchRanges = null; // frame / nested field -> [start, end) span within searchText
+let searchHits = null;   // sorted positions of the query in searchText (see bindSearch)
+let searchHitsCapped = false;
 let schema = null; // { messages: Map<fqn, MessageDef>, enums: Map<fqn, EnumDef>, methods: Map<path, {inputType, outputType}> }
 
 // Render-time registry of frame bodies whose decode + HTML build is deferred
 // until the frame is expanded. Rebuilt on every renderDetail().
 const lazyBodies = new Map();
-
-// Cap on how much payload text we index for search, per call. Decoding whole
-// multi-MB payloads to a searchable string on capture is what made bursts of
-// large calls crawl, so we bound it and build it lazily (see payloadSearchText).
-const SEARCH_TEXT_CAP = 256 * 1024;
 
 // Nested messages up to this depth render expanded; deeper levels render
 // collapsed and decode on expand, so opening one frame can't cascade an
@@ -30,7 +31,10 @@ const MAX_CALLS = 500;
 
 const callsEl = document.getElementById("calls");
 const detailEl = document.getElementById("detail");
-const schemaStatusEl = document.getElementById("schema-status");
+const schemaChipEl = document.getElementById("load-schema");
+const clearSchemaEl = document.getElementById("clear-schema");
+const matchCountEl = document.getElementById("match-count");
+const listCountEl = document.getElementById("list-count");
 const schemaFileEl = document.getElementById("schema-file");
 
 document.getElementById("clear").addEventListener("click", () => {
@@ -40,6 +44,7 @@ document.getElementById("clear").addEventListener("click", () => {
   detailToggles = {};
   userCollapsed.clear();
   userExpanded.clear();
+  pageShown = {};
   callsEl.textContent = "";
   renderDetail();
 });
@@ -49,10 +54,97 @@ let searchDebounce = 0;
 searchEl.addEventListener("input", () => {
   clearTimeout(searchDebounce);
   searchDebounce = setTimeout(() => {
-    searchQuery = searchEl.value;
+    listQuery = searchEl.value;
     applySearch();
-    renderDetail();
   }, 50);
+});
+
+// Content search: highlights, auto-opens and navigates inside the selected
+// call only; the sidebar box above filters which calls are listed.
+const detailSearchEl = document.getElementById("detail-search");
+let detailDebounce = 0;
+detailSearchEl.addEventListener("input", () => {
+  clearTimeout(detailDebounce);
+  detailDebounce = setTimeout(() => {
+    searchQuery = detailSearchEl.value;
+    renderDetail();
+    scrollToFirstMatch();
+  }, 50);
+});
+
+// ---------- Keyboard ----------
+
+// Arrows walk the visible call list from anywhere in the panel; Cmd/Ctrl+F
+// focuses the filter; Enter / Shift+Enter cycle through highlighted matches.
+let markIdx = -1;
+
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    const target = e.shiftKey ? searchEl : detailSearchEl; // F = in-call, Shift+F = filter
+    target.focus();
+    target.select();
+    return;
+  }
+  if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    e.preventDefault();
+    moveSelection(e.key === "ArrowDown" ? 1 : -1);
+  }
+});
+
+detailSearchEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    jumpMatch(e.shiftKey ? -1 : 1);
+  }
+});
+
+function moveSelection(dir) {
+  const rows = callsEl.querySelectorAll("li:not([hidden])");
+  if (!rows.length) return;
+  let idx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if (Number(rows[i].dataset.id) === selectedId) { idx = i; break; }
+  }
+  idx = idx === -1 ? (dir > 0 ? 0 : rows.length - 1)
+                   : Math.max(0, Math.min(rows.length - 1, idx + dir));
+  setSelection(Number(rows[idx].dataset.id));
+  rows[idx].scrollIntoView({ block: "nearest" });
+  renderDetail();
+}
+
+function jumpMatch(dir) {
+  const marks = detailEl.querySelectorAll("mark");
+  if (!marks.length) return;
+  if (markIdx >= 0 && markIdx < marks.length) marks[markIdx].classList.remove("current");
+  markIdx = ((markIdx + dir) % marks.length + marks.length) % marks.length;
+  marks[markIdx].classList.add("current");
+  marks[markIdx].scrollIntoView({ block: "center" });
+}
+
+// ---------- Theme ----------
+
+// "auto" tracks the DevTools theme via color-scheme; "light"/"dark" pin it
+// through the data-theme attribute (see :root rules in panel.css).
+const themeBtn = document.getElementById("theme");
+const THEMES = ["auto", "light", "dark"];
+
+function applyTheme(t) {
+  if (t === "auto") document.documentElement.removeAttribute("data-theme");
+  else document.documentElement.setAttribute("data-theme", t);
+  themeBtn.textContent = t;
+  themeBtn.title = "Theme: " + t + " — click to cycle";
+}
+
+themeBtn.addEventListener("click", () => {
+  const cur = document.documentElement.getAttribute("data-theme") || "auto";
+  const next = THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length];
+  applyTheme(next);
+  chrome.storage.local.set({ theme: next });
+});
+
+chrome.storage.local.get("theme", (data) => {
+  if (data && THEMES.includes(data.theme)) applyTheme(data.theme);
 });
 
 // ---------- Resizable call list ----------
@@ -104,15 +196,17 @@ callsEl.addEventListener("click", (e) => {
   if (!li || !callsEl.contains(li)) return;
   setSelection(Number(li.dataset.id));
   renderDetail();
+  scrollToFirstMatch();
 });
 
-document.getElementById("load-schema").addEventListener("click", () => {
+schemaChipEl.addEventListener("click", () => {
   schemaFileEl.click();
 });
 
-document.getElementById("clear-schema").addEventListener("click", () => {
+clearSchemaEl.addEventListener("click", () => {
   schema = null;
-  chrome.storage.local.remove("schemaB64", () => {
+  invalidateSearch();
+  chrome.storage.local.remove(["schemaB64", "schemaName"], () => {
     setSchemaStatus("no schema");
     renderDetail();
   });
@@ -120,29 +214,46 @@ document.getElementById("clear-schema").addEventListener("click", () => {
 
 schemaFileEl.addEventListener("change", (e) => {
   const file = e.target.files && e.target.files[0];
-  if (!file) return;
+  if (file) loadSchemaFile(file);
+  schemaFileEl.value = "";
+});
+
+// A descriptor set dropped anywhere on the panel loads as the schema.
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file) loadSchemaFile(file);
+});
+
+function loadSchemaFile(file) {
   const reader = new FileReader();
   reader.onload = () => {
     const bytes = new Uint8Array(reader.result);
     try {
       const fileSet = parseFileDescriptorSet(bytes);
       schema = buildSchemaIndex(fileSet);
-      const b64 = bytesToBase64(bytes);
-      chrome.storage.local.set({ schemaB64: b64 }, () => {
-        setSchemaStatus(`${schema.messages.size} msgs · ${schema.methods.size} RPCs`, "loaded");
+      invalidateSearch();
+      chrome.storage.local.set({ schemaB64: bytesToBase64(bytes), schemaName: file.name }, () => {
+        setSchemaStatus(file.name, "loaded",
+          `${file.name} — ${schema.messages.size} messages, ${schema.methods.size} RPCs. Click to replace.`);
         renderDetail();
       });
     } catch (err) {
-      setSchemaStatus("parse failed: " + err.message, "error");
+      setSchemaStatus("schema error", "error", "parse failed: " + err.message);
     }
   };
   reader.readAsArrayBuffer(file);
-  schemaFileEl.value = "";
-});
+}
 
-function setSchemaStatus(text, cls) {
-  schemaStatusEl.textContent = text;
-  schemaStatusEl.className = cls || "";
+const SCHEMA_CHIP_HINT =
+  "Load a FileDescriptorSet (.binpb / .pb / .bin) — click, or drop the file anywhere on the panel";
+
+function setSchemaStatus(text, cls, title) {
+  schemaChipEl.textContent = text;
+  schemaChipEl.className = "chip " + (cls || "");
+  schemaChipEl.title = title || SCHEMA_CHIP_HINT;
+  clearSchemaEl.hidden = cls !== "loaded";
 }
 
 chrome.devtools.network.onRequestFinished.addListener(handleRequest);
@@ -167,6 +278,7 @@ function handleRequest(req) {
     timeMs: Math.round(req.time || 0),
     startedLabel: formatClock(req.startedDateTime),
     grpcStatus: undefined, // filled from the trailer once the response arrives
+    settled: false,        // true once getContent has come back (even empty)
     reqFrames: null,
     resFrames: null,
     trailer: null,
@@ -192,19 +304,21 @@ function handleRequest(req) {
   evictOverflow();
 
   req.getContent((content, encoding) => {
+    entry.settled = true;
     try {
-      if (content == null) return;
-      let bytes =
-        encoding === "base64" ? base64ToBytes(content) : latin1ToBytes(content);
-      if (isText) bytes = maybeBase64Decode(bytes);
-      const frames = parseFrames(bytes);
-      entry.resFrames = frames.filter((f) => !f.isTrailer);
-      const trailer = frames.find((f) => f.isTrailer);
-      if (trailer) entry.trailer = parseTrailer(trailer.payload);
-      entry.grpcStatus = entry.trailer ? entry.trailer.headers["grpc-status"] : undefined;
-      entry._payloadText = null; // response frames changed; drop any cached index
-      if (entry.trailer && entry.trailer.raw) {
-        entry._search += "\n" + entry.trailer.raw.toLowerCase();
+      if (content != null) {
+        let bytes =
+          encoding === "base64" ? base64ToBytes(content) : latin1ToBytes(content);
+        if (isText) bytes = maybeBase64Decode(bytes);
+        const frames = parseFrames(bytes);
+        entry.resFrames = frames.filter((f) => !f.isTrailer);
+        const trailer = frames.find((f) => f.isTrailer);
+        if (trailer) entry.trailer = parseTrailer(trailer.payload);
+        entry.grpcStatus = entry.trailer ? entry.trailer.headers["grpc-status"] : undefined;
+        entry._payloadText = null; // response frames changed; drop any cached index
+        if (entry.trailer && entry.trailer.raw) {
+          entry._search += "\n" + entry.trailer.raw.toLowerCase();
+        }
       }
     } catch (e) {
       entry.error = (entry.error ? entry.error + "; " : "") + "response decode: " + e.message;
@@ -214,25 +328,168 @@ function handleRequest(req) {
   });
 }
 
-// Build (once) the searchable payload text for a call, capped at SEARCH_TEXT_CAP.
-// Only called when there's an actual query, so calls that are never searched
-// never pay the decode cost. Invalidated by setting entry._payloadText = null.
+// Build (once) the searchable text for a call: the names and values the detail
+// pane prints, lowercased. Earlier versions searched the raw bytes as UTF-8,
+// which missed numbers, field names and enum names and matched stray tag
+// bytes; a later one capped the text at 256KB per call, which silently missed
+// anything rendered past the cap on big payloads. Now the whole call is
+// indexed — built only when a query runs, cached on the entry, dropped with
+// the call on eviction. Invalidated by setting entry._payloadText = null.
+// ponytail: index size ~= decoded payload size, so a huge call roughly doubles
+// its memory while cached; re-cap per call (with a visible "truncated" hint)
+// if that ever matters.
+//
+// entry._ranges records each frame's and nested message's [start, end) span in
+// that text, so nodeHit() can answer "does this subtree match" with one indexOf
+// instead of decoding the subtree again on every render.
+//
 function payloadSearchText(entry) {
   if (entry._payloadText != null) return entry._payloadText;
-  const dec = new TextDecoder("utf-8", { fatal: false });
-  let text = "";
-  for (const frames of [entry.reqFrames, entry.resFrames]) {
-    if (!frames) continue;
-    for (const f of frames) {
-      const remaining = SEARCH_TEXT_CAP - text.length;
-      if (remaining <= 0) break;
-      const slice = f.payload.length > remaining ? f.payload.subarray(0, remaining) : f.payload;
-      try { text += dec.decode(slice) + "\n"; } catch {}
+  const out = { parts: [], len: 0 };
+  const ranges = new Map();
+  const { inputDef, outputDef } = methodDefs(entry);
+  for (const [frames, def] of [[entry.reqFrames, inputDef], [entry.resFrames, outputDef]]) {
+    for (const f of frames || []) {
+      const start = out.len;
+      if (def) pushTok(out, def.name);
+      indexFields(out, decodedFields(f), def, ranges, 0);
+      ranges.set(f, [start, out.len]);
     }
-    if (text.length >= SEARCH_TEXT_CAP) break;
   }
-  entry._payloadText = text.toLowerCase();
+  entry._ranges = ranges;
+  entry._payloadText = out.parts.join("").toLowerCase();
   return entry._payloadText;
+}
+
+function pushTok(out, s) {
+  if (s == null) return;
+  out.parts.push(s, "\n");
+  out.len += s.length + 1;
+}
+
+// Mirrors what renderFields prints. If a value gets a new visible form there,
+// add it here too or search will miss it.
+function indexFields(out, fields, messageDef, ranges, depth) {
+  if (depth > 32) return; // strict-decode false positives can nest; don't blow the stack
+  const defByNum = defByNumFor(messageDef);
+  for (const f of fields) {
+    const fStart = out.len;
+    const def = defByNum ? defByNum.get(f.fieldNumber) : null;
+    pushTok(out, "#" + f.fieldNumber);
+    if (def) pushTok(out, def.name);
+    if (f.wireType === 0) {
+      const u = f.varint;
+      const t = def ? def.type : 0;
+      if (t === PB_TYPE.BOOL) {
+        pushTok(out, Number(u) === 0 ? "false" : "true");
+      } else if (t === PB_TYPE.ENUM) {
+        const enumDef = schema && schema.enums.get(def.typeName);
+        const vDef = enumDef && enumDef.values.find((v) => v.number === Number(u));
+        if (enumDef) pushTok(out, enumDef.name);
+        if (vDef) pushTok(out, vDef.name);
+        pushTok(out, u.toString());
+      } else if (t === PB_TYPE.SINT32 || t === PB_TYPE.SINT64) {
+        pushTok(out, zigzag(u).toString());
+      } else if (t === PB_TYPE.INT32 || t === PB_TYPE.INT64) {
+        pushTok(out, s64ToSigned(u).toString());
+      } else {
+        pushTok(out, u.toString());
+        if (!def) pushTok(out, zigzag(u).toString());
+      }
+    } else if (f.wireType === 1 || f.wireType === 5) {
+      // Typed fields only show one interpretation, but indexing all four is cheap.
+      const i = f.wireType === 1 ? fixed64Interp(f.fixed) : fixed32Interp(f.fixed);
+      for (const k in i) pushTok(out, String(i[k]));
+    } else if (def && def.type === PB_TYPE.STRING) {
+      pushTok(out, JSON.stringify(new TextDecoder().decode(f.bytes)));
+    } else if (def && def.type === PB_TYPE.BYTES) {
+      pushTok(out, bytesToHex(f.bytes, 64));
+    } else if (def && (def.type === PB_TYPE.MESSAGE || def.type === PB_TYPE.GROUP)) {
+      const subDef = schema && schema.messages.get(def.typeName);
+      pushTok(out, subDef ? subDef.name : (def.typeName || "message").replace(/^\./, ""));
+      indexFields(out, subFields(f), subDef, ranges, depth + 1);
+    } else if (def) {
+      pushTok(out, bytesToHex(f.bytes, 64));
+    } else {
+      classifyField(f);
+      if (f._nested) {
+        indexFields(out, f._nested, null, ranges, depth + 1);
+        // Ambiguous bytes (a valid message that is also printable text) index
+        // both readings — the [str] toggle can show the string, so searching
+        // for it has to hit.
+        if (f._stringVal !== null) pushTok(out, JSON.stringify(f._stringVal));
+      } else if (f._stringVal !== null) {
+        pushTok(out, JSON.stringify(f._stringVal));
+      } else {
+        pushTok(out, bytesToHex(f.bytes, 48));
+      }
+    }
+    // Every field records its span, so nodeHit works for leaves too — paging
+    // relies on it to keep a matching row visible beyond the shown page.
+    ranges.set(f, [fStart, out.len]);
+  }
+}
+
+// Non-strict decode of a schema-typed sub-message, cached on the field so the
+// search index and the renderer walk the same objects (ranges are keyed by them).
+function subFields(f) {
+  if (f._msg === undefined) f._msg = decodeMessage(f.bytes, false) || [];
+  return f._msg;
+}
+
+// Does this frame's / nested field's decoded subtree contain the query?
+// Answered from the span recorded by payloadSearchText for the selected call.
+// Point the search machinery at one call: its index text, its node spans, and
+// every position of the query in that text, found in a single pass. nodeHit
+// used to run indexOf from each node's start — each miss scanned to the end of
+// a multi-MB index, and with tens of thousands of nodes per render that was
+// tens of seconds per keystroke. One scan + binary search per node instead.
+function bindSearch(entry) {
+  if (!entry) { searchText = ""; searchRanges = null; searchHits = null; return; }
+  searchText = payloadSearchText(entry);
+  searchRanges = entry._ranges;
+  searchHits = null;
+  searchHitsCapped = false;
+  // A 1-char query matches nearly every node; auto-opening all of them builds
+  // a huge tree for a query the user is still typing. Rows still filter and
+  // rendered text still gets marks — only the auto-open waits for 2 chars.
+  if (searchQuery.length < 2) return;
+  searchHits = [];
+  const ql = searchQuery.toLowerCase();
+  // Non-overlapping, capped: a broad query ("000" on numeric data) can hit
+  // millions of positions; past the cap the count shows "+" and deep-tail
+  // nodes stop auto-opening, which is all a query that broad deserves.
+  for (let i = searchText.indexOf(ql); i !== -1; i = searchText.indexOf(ql, i + ql.length)) {
+    searchHits.push(i);
+    if (searchHits.length >= 50000) { searchHitsCapped = true; break; }
+  }
+}
+
+function nodeHit(node) {
+  if (!searchHits || !searchHits.length || !searchRanges) return false;
+  const r = searchRanges.get(node);
+  if (!r) return false;
+  let lo = 0, hi = searchHits.length; // first hit at or after the node's start
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (searchHits[mid] < r[0]) lo = mid + 1; else hi = mid;
+  }
+  return lo < searchHits.length && searchHits[lo] < r[1];
+}
+
+// Field names and typed values come from the schema, so a schema change makes
+// every cached search text stale.
+function invalidateSearch() {
+  for (const c of calls) c._payloadText = null;
+}
+
+function methodDefs(entry) {
+  const methodDef = schema ? schema.methods.get(entry.method) : null;
+  return {
+    methodDef,
+    inputDef: methodDef ? schema.messages.get(methodDef.inputType) : null,
+    outputDef: methodDef ? schema.messages.get(methodDef.outputType) : null,
+  };
 }
 
 function headerValue(headers, name) {
@@ -299,15 +556,25 @@ function parseTrailer(payload) {
 
 // ---------- Protobuf wire-format decoder ----------
 
+// Varints up to 7 bytes (49 bits) decode as plain numbers, which covers nearly
+// everything real. Only 8-10 byte ones fall back to BigInt, so callers see
+// number | bigint and must not use BigInt-only operators on the value.
 function readVarint(buf, pos) {
-  let result = 0n;
-  let shift = 0n;
-  let i = pos;
   const end = Math.min(buf.length, pos + 10);
-  while (i < end) {
-    const b = buf[i++];
-    result |= BigInt(b & 0x7f) << shift;
-    if ((b & 0x80) === 0) return { value: result, next: i };
+  let result = 0;
+  let mul = 1;
+  for (let i = pos; i < end && i < pos + 7; i++) {
+    const b = buf[i];
+    result += (b & 0x7f) * mul;
+    if ((b & 0x80) === 0) return { value: result, next: i + 1 };
+    mul *= 128;
+  }
+  let big = 0n;
+  let shift = 0n;
+  for (let i = pos; i < end; i++) {
+    const b = buf[i];
+    big |= BigInt(b & 0x7f) << shift;
+    if ((b & 0x80) === 0) return { value: big, next: i + 1 };
     shift += 7n;
   }
   throw new Error("varint overflow / truncated");
@@ -321,8 +588,10 @@ function decodeMessage(buf, strict) {
     try { tagRes = readVarint(buf, i); } catch { return strict ? null : out; }
     const tag = tagRes.value;
     i = tagRes.next;
-    const fieldNumber = Number(tag >> 3n);
-    const wireType = Number(tag & 7n);
+    // A valid tag fits in 5 bytes; a BigInt here means garbage.
+    if (typeof tag !== "number") return strict ? null : out;
+    const fieldNumber = Math.floor(tag / 8);
+    const wireType = tag % 8;
     if (fieldNumber === 0) return strict ? null : out;
     if (![0, 1, 2, 5].includes(wireType)) return strict ? null : out;
 
@@ -366,7 +635,10 @@ function classifyField(f) {
   if (f._nested !== undefined) return;
   const nested = f.bytes && f.bytes.length > 0 ? decodeMessage(f.bytes, true) : null;
   f._nested = nested && nested.length > 0 ? nested : null;
-  f._stringVal = f._nested ? null : tryString(f.bytes);
+  // Computed even when the bytes parse as a message: short strings can be
+  // false-positive messages, and both the [str] toggle and the search index
+  // need the string reading of an ambiguous field.
+  f._stringVal = tryString(f.bytes);
 }
 
 function tryString(buf) {
@@ -384,7 +656,8 @@ function tryString(buf) {
 }
 
 function zigzag(n) {
-  return (n >> 1n) ^ -(n & 1n);
+  if (typeof n === "bigint") return (n >> 1n) ^ -(n & 1n);
+  return n % 2 ? -(n + 1) / 2 : n / 2;
 }
 
 function bytesToHex(buf, max) {
@@ -553,10 +826,9 @@ function escapeHtml(s) {
 }
 
 // Escape, then wrap matches of searchQuery in <mark>.
-function hl(text) {
+function hl(text, q = searchQuery) {
   if (text == null) return "";
   const s = String(text);
-  const q = searchQuery;
   if (!q) return escapeHtml(s);
   const lower = s.toLowerCase();
   const ql = q.toLowerCase();
@@ -577,6 +849,32 @@ function formatDuration(ms) {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
+function formatBytes(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+// Canonical gRPC status names, indexed by code number.
+const GRPC_CODES = ["OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED",
+  "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED",
+  "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL",
+  "UNAVAILABLE", "DATA_LOSS", "UNAUTHENTICATED"];
+
+// One verdict per call, gRPC first: HTTP only matters when the transport
+// itself failed; otherwise the trailer's grpc-status is the real result.
+function entryStatus(entry) {
+  if (!(entry.status >= 200 && entry.status < 400)) {
+    return { cls: "bad", label: "HTTP " + entry.status };
+  }
+  if (entry.grpcStatus != null && entry.grpcStatus !== "0") {
+    const name = GRPC_CODES[Number(entry.grpcStatus)];
+    return { cls: "bad", label: name || "gRPC " + entry.grpcStatus };
+  }
+  if (!entry.settled) return { cls: "pending", label: "pending" };
+  return { cls: "ok", label: "OK" };
+}
+
 // Wall-clock HH:MM:SS from the request's HAR start time, so rows fired against
 // the same method path stay tellable apart. Falls back to capture time.
 function formatClock(iso) {
@@ -595,23 +893,33 @@ function entryMatches(entry, q) {
 }
 
 function listItemHtml(entry) {
-  const httpClass = entry.status >= 200 && entry.status < 400 ? "status-ok" : "status-bad";
-  // A 200 with grpc-status != 0 is a failed RPC — surface it so the row doesn't
-  // read as green/OK. grpc-status is only known once the trailer is parsed.
-  const grpcBad = entry.grpcStatus != null && entry.grpcStatus !== "0";
-  const grpcBadge = grpcBad ? ` · <span class="status-bad">gRPC ${hl(entry.grpcStatus)}</span>` : "";
-  const time = entry.startedLabel ? `${entry.startedLabel} · ` : "";
-  return `<div class="method">${hl(entry.method)}</div>` +
-         `<div class="meta"><span class="seq">#${entry.id}</span> · ${time}` +
-         `<span class="${httpClass}">HTTP ${entry.status}</span>${grpcBadge} · ${formatDuration(entry.timeMs)}</div>`;
+  const st = entryStatus(entry);
+  const cut = entry.method.lastIndexOf("/");
+  const name = entry.method.slice(cut + 1);
+  const svc = cut > 0 ? entry.method.slice(1, cut) : "";
+  const time = entry.startedLabel ? ` · ${entry.startedLabel}` : "";
+  const n = entry.resFrames ? entry.resFrames.length : null;
+  const frames = n == null ? "" : ` · ${n} frame${n === 1 ? "" : "s"}`;
+  return `<div class="row-top"><span class="dot ${st.cls}"></span><span class="name">${hl(name, listQuery)}</span>` +
+         (svc ? `<span class="svc">${hl(svc, listQuery)}</span>` : "") + `</div>` +
+         `<div class="meta"><span class="seq">#${entry.id}</span> · <span class="st-${st.cls}">${hl(st.label, listQuery)}</span>` +
+         ` · ${formatDuration(entry.timeMs)}${frames}${time}</div>`;
+}
+
+// Rebuild a row's markup and its status class together so they can't drift.
+function syncRow(li, entry) {
+  li.innerHTML = listItemHtml(entry);
+  li.classList.toggle("bad", entryStatus(entry).cls === "bad");
 }
 
 function appendListItem(entry) {
   const li = document.createElement("li");
   li.dataset.id = String(entry.id);
+  li.setAttribute("role", "option");
+  li.setAttribute("aria-selected", entry.id === selectedId ? "true" : "false");
   if (entry.id === selectedId) li.classList.add("selected");
-  li.innerHTML = listItemHtml(entry);
-  if (searchQuery && !entryMatches(entry, searchQuery)) li.hidden = true;
+  syncRow(li, entry);
+  if (listQuery && !entryMatches(entry, listQuery)) li.hidden = true;
   liById.set(entry.id, li);
   callsEl.appendChild(li);
 }
@@ -632,60 +940,105 @@ function evictOverflow() {
   }
 }
 
+let searchGen = 0; // abandons in-flight row filtering when the query changes
+
 function applySearch() {
+  const gen = ++searchGen;
+  const ql = listQuery.toLowerCase();
+  const pending = [];
   for (const entry of calls) {
     const li = liById.get(entry.id);
     if (!li) continue;
-    const matches = !searchQuery || entryMatches(entry, searchQuery);
-    li.hidden = !matches;
-    if (matches) li.innerHTML = listItemHtml(entry);
+    if (!listQuery) { li.hidden = false; syncRow(li, entry); continue; }
+    // Rows answerable right now: a cheap method/url/trailer hit, or a payload
+    // index that is already built.
+    if (entry._search.includes(ql) || entry._payloadText != null) {
+      const matches = entryMatches(entry, listQuery);
+      li.hidden = !matches;
+      if (matches) syncRow(li, entry);
+    } else {
+      pending.push(entry);
+    }
   }
+  if (pending.length) applySearchChunk(gen, pending, 0);
+  updateListCount();
+}
+
+// Building a call's search index decodes its whole payload. Doing that for
+// every captured call inside one keystroke froze the panel on big responses,
+// so the uncached ones are indexed on a time budget per tick; rows resolve
+// progressively and a newer query abandons the rest.
+function applySearchChunk(gen, entries, i) {
+  if (gen !== searchGen) return;
+  const t0 = Date.now();
+  while (i < entries.length && Date.now() - t0 < 12) {
+    const entry = entries[i++];
+    const li = liById.get(entry.id);
+    if (!li) continue;
+    const matches = entryMatches(entry, listQuery);
+    li.hidden = !matches;
+    if (matches) syncRow(li, entry);
+  }
+  if (i < entries.length) setTimeout(() => applySearchChunk(gen, entries, i), 0);
+  else updateListCount();
 }
 
 function refreshEntryVisibility(entry) {
   const li = liById.get(entry.id);
   if (!li) return;
   // The response just arrived, so grpc-status / duration may now be known.
-  li.innerHTML = listItemHtml(entry);
-  li.hidden = searchQuery ? !entryMatches(entry, searchQuery) : false;
+  syncRow(li, entry);
+  li.hidden = listQuery ? !entryMatches(entry, listQuery) : false;
 }
 
 function setSelection(id) {
   if (selectedId === id) return;
   const prev = liById.get(selectedId);
-  if (prev) prev.classList.remove("selected");
+  if (prev) { prev.classList.remove("selected"); prev.setAttribute("aria-selected", "false"); }
   selectedId = id;
   const next = liById.get(id);
-  if (next) next.classList.add("selected");
+  if (next) { next.classList.add("selected"); next.setAttribute("aria-selected", "true"); }
 }
 
 function renderDetail() {
+  expandGen++; // a full re-render supersedes any expand-all still pumping
   lazyBodies.clear();
+  fullValues.clear();
+  hitBudget = HIT_BUDGET;
+  markIdx = -1; // marks are about to be rebuilt
   const entry = calls.find((c) => c.id === selectedId);
   if (!entry) {
     detailEl.innerHTML = '<div class="placeholder">Select a call to inspect.</div>';
+    updateMatchCount();
     return;
   }
 
-  const methodDef = schema ? schema.methods.get(entry.method) : null;
-  const inputDef = methodDef ? schema.messages.get(methodDef.inputType) : null;
-  const outputDef = methodDef ? schema.messages.get(methodDef.outputType) : null;
+  const { methodDef, inputDef, outputDef } = methodDefs(entry);
+  bindSearch(searchQuery ? entry : null);
 
   const parts = [];
-  parts.push(`<h1>${hl(entry.method)}</h1>`);
+  const cut = entry.method.lastIndexOf("/");
+  parts.push(`<h1><span class="h1-svc">${hl(entry.method.slice(0, cut + 1))}</span>${hl(entry.method.slice(cut + 1))}</h1>`);
+  const st = entryStatus(entry);
+  parts.push(`<div class="statusline"><span class="pill ${st.cls}">${hl(st.label)}</span>` +
+             `<span class="field-type">HTTP ${entry.status} · ${formatDuration(entry.timeMs)}</span></div>`);
   parts.push(`<div class="url">${hl(entry.url)}</div>`);
   if (methodDef) {
     parts.push(`<div class="url"><span class="field-name">${hl(methodDef.inputType || "?")}</span> &rarr; <span class="field-name">${hl(methodDef.outputType || "?")}</span></div>`);
   } else if (schema) {
     parts.push(`<div class="url"><em>no schema entry for this method</em></div>`);
   }
+  parts.push('<div class="actions"><button data-action="expand" title="Open every frame and nested message">expand all</button>' +
+             '<button data-action="collapse" title="Back to the default: frames closed">collapse all</button></div>');
 
   if (entry.error) {
     parts.push(`<section><h3>Errors</h3><div class="frame trailer bad"><div class="frame-body">${escapeHtml(entry.error)}</div></div></section>`);
   }
 
   parts.push("<section><h3>Request</h3>" + renderFrames(entry.reqFrames, `${entry.id}.req`, inputDef) + "</section>");
-  parts.push("<section><h3>Response</h3>" + renderFrames(entry.resFrames, `${entry.id}.res`, outputDef) + "</section>");
+  const nRes = entry.resFrames ? entry.resFrames.length : null;
+  const resHdr = nRes == null ? "Response" : `Response · ${nRes} data frame${nRes === 1 ? "" : "s"}`;
+  parts.push(`<section><h3>${resHdr}</h3>` + renderFrames(entry.resFrames, `${entry.id}.res`, outputDef) + "</section>");
 
   if (entry.trailer) {
     const grpcStatus = entry.trailer.headers["grpc-status"];
@@ -699,6 +1052,100 @@ function renderDetail() {
   }
 
   detailEl.innerHTML = parts.join("");
+  updateMatchCount();
+}
+
+// "N matches" = highlighted hits in the detail pane, i.e. what Ctrl+F would
+// count on what's actually shown (matching branches auto-open, so payload hits
+// are materialized). With no call selected, fall back to how many calls match.
+function updateMatchCount() {
+  if (!searchQuery || selectedId == null || !calls.some((c) => c.id === selectedId)) {
+    matchCountEl.textContent = "";
+    return;
+  }
+  // Index hits when available (1-char queries have none — fall back to marks).
+  const n = searchHits ? searchHits.length : detailEl.querySelectorAll("mark").length;
+  matchCountEl.textContent =
+    n === 1 ? "1 match" : n + (searchHits && searchHitsCapped ? "+" : "") + " matches";
+}
+
+function updateListCount() {
+  if (!listQuery) { listCountEl.textContent = ""; return; }
+  const n = callsEl.querySelectorAll("li:not([hidden])").length;
+  listCountEl.textContent = n + " / " + calls.length + (calls.length === 1 ? " call" : " calls");
+}
+
+function scrollToFirstMatch() {
+  if (!searchQuery) return;
+  const m = detailEl.querySelector("mark");
+  if (m && m.scrollIntoView) m.scrollIntoView({ block: "center" });
+}
+
+// Expand / collapse all for the selected call. Collapse drops the call's
+// remembered toggles and re-renders back to the default (frames closed).
+// Expand doesn't re-render at all: it walks the live DOM and opens every
+// closed node, one batch per tick, injecting deferred bodies as it goes.
+// Building the whole tree in one synchronous render froze the panel on large
+// payloads; chunking keeps it painting and lets the user interrupt.
+// While a query is active, renders ignore the expanded state (see
+// detailsOpen), so a search keystroke never rebuilds a fully expanded tree.
+// ponytail: a msg/raw toggle without a query still rebuilds the whole open
+// tree in one pass; chunk renderDetail if that starts to hurt.
+const EXPAND_BATCH = 250;
+
+detailEl.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest("button[data-action]");
+  if (!b || !detailEl.contains(b) || selectedId == null) return;
+  if (b.dataset.action === "collapse") {
+    const prefix = selectedId + ".";
+    for (const set of [userExpanded, userCollapsed]) {
+      for (const k of set) if (k.startsWith(prefix)) set.delete(k);
+    }
+    for (const k in pageShown) if (k.startsWith(prefix)) delete pageShown[k];
+    renderDetail();
+    return;
+  }
+  expandAllStep(++expandGen, b);
+});
+
+function expandAllStep(gen, btn) {
+  if (gen !== expandGen) return; // a newer render or click took over
+  const closed = detailEl.querySelectorAll("details:not([open])");
+  const n = Math.min(closed.length, EXPAND_BATCH);
+  for (let i = 0; i < n; i++) openNode(closed[i]);
+  // Opening a batch can inject new closed children, so re-check rather than
+  // trusting the count above.
+  if (detailEl.querySelector("details:not([open])")) {
+    btn.textContent = "expanding…";
+    btn.disabled = true;
+    setTimeout(() => expandAllStep(gen, btn), 0);
+  } else {
+    btn.textContent = "expand all";
+    btn.disabled = false;
+  }
+}
+
+// Open one node the way a user click would: record the override so the state
+// survives re-renders, materialize a deferred body, then flip it open.
+function openNode(el) {
+  const k = el.getAttribute("data-key");
+  if (k) {
+    if (el.getAttribute("data-default") === "closed") userExpanded.add(k);
+    else userCollapsed.delete(k);
+  }
+  injectLazy(el);
+  el.open = true;
+}
+
+function injectLazy(el) {
+  hitBudget = HIT_BUDGET; // a user-driven expand deserves fresh search opens
+  const lazyKey = el.getAttribute("data-lazy");
+  if (!lazyKey) return;
+  const build = lazyBodies.get(lazyKey);
+  if (build) {
+    el.insertAdjacentHTML("beforeend", build());
+    lazyBodies.delete(lazyKey);
+  }
 }
 
 detailEl.addEventListener("click", (e) => {
@@ -706,12 +1153,136 @@ detailEl.addEventListener("click", (e) => {
   if (!t || !detailEl.contains(t)) return;
   e.stopPropagation();
   e.preventDefault();
+  const pk = t.getAttribute("data-page");
+  if (pk) {
+    pageShown[pk] = (pageShown[pk] || 1) + 1;
+    renderDetail();
+    return;
+  }
   const k = t.getAttribute("data-key");
   const to = t.getAttribute("data-to");
   if (to === "") delete detailToggles[k];
   else detailToggles[k] = to;
   renderDetail();
 });
+
+// ---------- Copy ----------
+
+const COPY_BTN = '<button class="copy" title="Copy value">⧉</button>';
+
+// Tacks the copy button inside a leaf <li>. Leaves have no nested lists, so
+// splicing before the closing tag is safe.
+function leafCopy(html) {
+  return html.slice(0, -"</li>".length) + COPY_BTN + "</li>";
+}
+
+function copyText(text, btn, label) {
+  const done = () => {
+    btn.textContent = "✓";
+    setTimeout(() => { btn.textContent = label; }, 900);
+  };
+  navigator.clipboard.writeText(text).then(done, () => {
+    // The clipboard API can be refused inside a devtools page; fall back.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+    done();
+  });
+}
+
+detailEl.addEventListener("click", (e) => {
+  const btn = e.target.closest && e.target.closest("button.copy, button.copy-json");
+  if (!btn || !detailEl.contains(btn)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (btn.classList.contains("copy")) {
+    // Copy what the row displays; strings lose their JSON quoting.
+    const li = btn.closest("li");
+    const val = li && li.querySelector(".field-val-str, .field-val-num, .field-val-hex, .enum-name");
+    const fk = val && val.getAttribute("data-fk");
+    if (fk && fullValues.has(fk)) { copyText(fullValues.get(fk), btn, "⧉"); return; }
+    let text = val ? val.textContent : "";
+    if (text.startsWith('"')) { try { text = JSON.parse(text); } catch {} }
+    copyText(text, btn, "⧉");
+    return;
+  }
+  const entry = calls.find((c) => c.id === selectedId);
+  if (!entry) return;
+  const frames = btn.dataset.frame === "req" ? entry.reqFrames : entry.resFrames;
+  const f = frames && frames[Number(btn.dataset.idx)];
+  if (!f) return;
+  const { inputDef, outputDef } = methodDefs(entry);
+  const def = btn.dataset.frame === "req" ? inputDef : outputDef;
+  copyText(JSON.stringify(fieldsToJson(decodedFields(f), def), null, 2), btn, "copy JSON");
+});
+
+// Decoded frame -> plain object, following the same interpretations the
+// renderer shows. Repeated fields collapse into arrays.
+function fieldsToJson(fields, messageDef, depth = 0) {
+  if (depth > 32) return "…";
+  const defByNum = defByNumFor(messageDef);
+  const out = {};
+  const arrays = new Set();
+  for (const f of fields) {
+    const def = defByNum ? defByNum.get(f.fieldNumber) : null;
+    const key = def ? def.name : "field_" + f.fieldNumber;
+    const v = fieldJsonValue(f, def, depth);
+    if (!(key in out)) out[key] = v;
+    else if (arrays.has(key)) out[key].push(v);
+    else { out[key] = [out[key], v]; arrays.add(key); }
+  }
+  return out;
+}
+
+// JSON.stringify chokes on BigInt: keep safe integers as numbers, stringify the rest.
+function jsonNum(v) {
+  if (typeof v !== "bigint") return v;
+  return v >= Number.MIN_SAFE_INTEGER && v <= Number.MAX_SAFE_INTEGER ? Number(v) : v.toString();
+}
+
+function fieldJsonValue(f, def, depth) {
+  if (f.wireType === 0) {
+    const u = f.varint;
+    const t = def ? def.type : 0;
+    if (t === PB_TYPE.BOOL) return Number(u) !== 0;
+    if (t === PB_TYPE.ENUM) {
+      const enumDef = schema && schema.enums.get(def.typeName);
+      const vDef = enumDef && enumDef.values.find((v) => v.number === Number(u));
+      return vDef ? vDef.name : jsonNum(u);
+    }
+    if (t === PB_TYPE.SINT32 || t === PB_TYPE.SINT64) return jsonNum(zigzag(u));
+    if (t === PB_TYPE.INT32 || t === PB_TYPE.INT64) return jsonNum(s64ToSigned(u));
+    return jsonNum(u);
+  }
+  if (f.wireType === 1 || f.wireType === 5) {
+    const i = f.wireType === 1 ? fixed64Interp(f.fixed) : fixed32Interp(f.fixed);
+    if (def) {
+      if (def.type === PB_TYPE.DOUBLE) return i.f64;
+      if (def.type === PB_TYPE.FLOAT) return i.f32;
+      if (def.type === PB_TYPE.SFIXED64) return i.i64;
+      if (def.type === PB_TYPE.FIXED64) return i.u64;
+      if (def.type === PB_TYPE.SFIXED32) return i.i32;
+      if (def.type === PB_TYPE.FIXED32) return i.u32;
+    }
+    return i; // schema-less: all four interpretations
+  }
+  if (def) {
+    if (def.type === PB_TYPE.STRING) return new TextDecoder("utf-8").decode(f.bytes);
+    if (def.type === PB_TYPE.BYTES) return bytesToHex(f.bytes);
+    if (def.type === PB_TYPE.MESSAGE || def.type === PB_TYPE.GROUP) {
+      const subDef = schema && schema.messages.get(def.typeName);
+      return fieldsToJson(subFields(f), subDef, depth + 1);
+    }
+    return bytesToHex(f.bytes);
+  }
+  classifyField(f);
+  if (f._nested) return fieldsToJson(f._nested, null, depth + 1);
+  if (f._stringVal !== null) return f._stringVal;
+  return bytesToHex(f.bytes);
+}
 
 // `toggle` does not bubble — listen in the capture phase to delegate.
 detailEl.addEventListener("toggle", (e) => {
@@ -728,14 +1299,7 @@ detailEl.addEventListener("toggle", (e) => {
 
   // First expand of a deferred node (frame or deep nested message): decode and
   // build its body now and inject it.
-  const lazyKey = el.getAttribute("data-lazy");
-  if (lazyKey && el.open) {
-    const build = lazyBodies.get(lazyKey);
-    if (build) {
-      el.insertAdjacentHTML("beforeend", build());
-      lazyBodies.delete(lazyKey);
-    }
-  }
+  if (el.open) injectLazy(el);
 }, true);
 
 function decodedFields(frame) {
@@ -746,31 +1310,56 @@ function decodedFields(frame) {
   return frame._fields;
 }
 
+// Frames page like fields do: a streaming response can carry thousands of
+// data frames, and rendering every summary — let alone every matching body —
+// froze the panel. Matching frames beyond the page stay visible while the
+// per-render hit budget lasts.
+const FRAME_PAGE = 100;
+
 function renderFrames(frames, kind, messageDef) {
   if (frames == null) return '<div class="placeholder" style="padding:8px">(no body captured)</div>';
   if (frames.length === 0) return '<div class="placeholder" style="padding:8px">(empty)</div>';
-  return frames.map((f, idx) => {
-    const frameKey = `${kind}-${idx}-frame`;
+  const which = kind.slice(kind.lastIndexOf(".") + 1); // "req" | "res"
+  const pageKey = `${kind}:frames`;
+  const shown = Math.min(frames.length, FRAME_PAGE * (pageShown[pageKey] || 1));
+  const parts = [];
+  let gap = 0;
+  for (let idx = 0; idx < frames.length; idx++) {
+    const f = frames[idx];
+    const hit = nodeHit(f) && spendHit();
+    if (idx >= shown && !hit) { gap++; continue; }
+    if (gap) { parts.push(`<div class="placeholder frame-gap">… ${gap} frames skipped</div>`); gap = 0; }
+    parts.push(renderFrame(f, idx, kind, which, messageDef, hit));
+  }
+  if (gap) {
+    parts.push(`<div class="placeholder frame-gap"><button class="toggle" data-page="${escapeHtml(pageKey)}">` +
+               `[show ${Math.min(FRAME_PAGE, gap)} more of ${gap} hidden]</button></div>`);
+  }
+  return parts.join("");
+}
+
+function renderFrame(f, idx, kind, which, messageDef, hit) {
+  const frameKey = `${kind}-${idx}-frame`;
     const flagHex = f.flag.toString(16).padStart(2, "0");
     const summary =
-      `<summary class="frame-hdr">data frame #${idx} · ${f.payload.length} B · flag 0x${flagHex}` +
-      `${messageDef ? ` · <span class="field-name">${hl(messageDef.name)}</span>` : ""}</summary>`;
+      `<summary class="frame-hdr" title="flag 0x${flagHex}">data frame #${idx} · ${formatBytes(f.payload.length)}` +
+      `${messageDef ? ` · <span class="field-name">${hl(messageDef.name)}</span>` : ""}` +
+      `<button class="copy-json" data-frame="${which}" data-idx="${idx}" title="Copy the decoded frame as JSON">copy JSON</button></summary>`;
     // Decode the wire format and build the field tree only when actually shown.
     const renderBody = () =>
       `<div class="frame-body"><ul class="fields">` +
       `${renderFields(decodedFields(f), `${kind}-${idx}`, [], messageDef)}</ul></div>`;
 
-    if (detailsOpen(frameKey, false) === "open" || bytesContainQuery(f.payload)) {
-      return `<details class="frame" open data-key="${escapeHtml(frameKey)}" data-default="closed">` +
-             summary + renderBody() + `</details>`;
-    }
-    // Collapsed: emit only the summary and defer the body until expanded. This
-    // is what keeps a burst of large calls cheap — nothing under a closed frame
-    // is decoded or turned into DOM.
-    lazyBodies.set(frameKey, renderBody);
-    return `<details class="frame" data-key="${escapeHtml(frameKey)}" data-default="closed" data-lazy="${escapeHtml(frameKey)}">` +
-           summary + `</details>`;
-  }).join("");
+  if (detailsOpen(frameKey, false) === "open" || hit) {
+    return `<details class="frame" open data-key="${escapeHtml(frameKey)}" data-default="closed">` +
+           summary + renderBody() + `</details>`;
+  }
+  // Collapsed: emit only the summary and defer the body until expanded. This
+  // is what keeps a burst of large calls cheap — nothing under a closed frame
+  // is decoded or turned into DOM.
+  lazyBodies.set(frameKey, renderBody);
+  return `<details class="frame" data-key="${escapeHtml(frameKey)}" data-default="closed" data-lazy="${escapeHtml(frameKey)}">` +
+         summary + `</details>`;
 }
 
 // FieldDescriptorProto.Type values
@@ -785,7 +1374,8 @@ function typeLabel(t) {
   return "unknown";
 }
 
-function s64ToSigned(u) { // BigInt unsigned 64 -> signed
+function s64ToSigned(u) { // unsigned 64 -> signed; plain numbers are < 2^49 so already fine
+  if (typeof u !== "bigint") return u;
   return u >= (1n << 63n) ? u - (1n << 64n) : u;
 }
 
@@ -800,26 +1390,59 @@ function defByNumFor(messageDef) {
   return m;
 }
 
+// How many children of one node render before the rest hide behind a
+// "show more" stub. Opening a frame with tens of thousands of repeated items
+// used to materialize all of them in one go — tens of MB of HTML and seconds
+// of freeze, worse on every search keystroke. Paging bounds every level.
+// Fields that match the query always render, so search can surface an item on
+// page 40 without paging to it.
+const CHILD_PAGE = 200;
+let pageShown = {}; // pageKey -> pages requested via [show more]
+
+// A broad query can match thousands of nodes at once; force-showing or
+// auto-opening every one of them re-creates the freeze that paging fixed.
+// Each render gets a budget of search-driven extras — matches past it render
+// as ordinary gaps and closed summaries, and the counter still shows the
+// real total from the index.
+const HIT_BUDGET = 25;
+let hitBudget = 0;
+function spendHit() { return hitBudget-- > 0; }
+
 function renderFields(fields, path, crumbs, messageDef, depth = 0) {
   if (!fields || fields.length === 0) return '<li class="field-type">(empty)</li>';
   const defByNum = defByNumFor(messageDef);
+  const pageKey = `${path}:${crumbs.join(".")}`;
+  const shown = Math.min(fields.length, CHILD_PAGE * (pageShown[pageKey] || 1));
+  const parts = [];
+  let gap = 0;
+  for (let idx = 0; idx < fields.length; idx++) {
+    const f = fields[idx];
+    if (idx >= shown && !(nodeHit(f) && spendHit())) { gap++; continue; }
+    if (gap) { parts.push(`<li class="field-type">… ${gap} fields skipped</li>`); gap = 0; }
+    parts.push(renderField(f, idx, path, crumbs, defByNum, depth));
+  }
+  if (gap) {
+    parts.push(`<li class="field-type"><button class="toggle" data-page="${escapeHtml(pageKey)}">` +
+               `[show ${Math.min(CHILD_PAGE, gap)} more of ${gap} hidden]</button></li>`);
+  }
+  return parts.join("");
+}
 
-  return fields.map((f, idx) => {
-    const myCrumbs = crumbs.concat(idx);
-    const key = `${path}.${myCrumbs.join(".")}`;
-    const def = defByNum ? defByNum.get(f.fieldNumber) : null;
+function renderField(f, idx, path, crumbs, defByNum, depth) {
+  const myCrumbs = crumbs.concat(idx);
+  const key = `${path}.${myCrumbs.join(".")}`;
+  const def = defByNum ? defByNum.get(f.fieldNumber) : null;
 
-    const tagHtml = def
-      ? `<span class="field-name">${hl(def.name)}</span> <span class="field-type">#${f.fieldNumber}</span>`
-      : `<span class="field-tag">#${f.fieldNumber}</span>`;
+  const tagHtml = def
+    ? `<span class="field-name">${hl(def.name)}</span> <span class="field-type">${hl("#" + f.fieldNumber)}</span>`
+    : `<span class="field-tag">${hl("#" + f.fieldNumber)}</span>`;
 
-    if (f.wireType === 0) return renderVarint(tagHtml, f, def);
-    if (f.wireType === 1) return renderFixed(tagHtml, f, def, 64);
-    if (f.wireType === 5) return renderFixed(tagHtml, f, def, 32);
+  if (f.wireType === 0) return leafCopy(renderVarint(tagHtml, f, def));
+  if (f.wireType === 1) return leafCopy(renderFixed(tagHtml, f, def, 64));
+  if (f.wireType === 5) return leafCopy(renderFixed(tagHtml, f, def, 32));
 
-    // wireType 2 — length-delimited
-    return renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs, depth);
-  }).join("");
+  // wireType 2 — length-delimited
+  return renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs, depth);
 }
 
 // Render a collapsible nested-message node. Its children are produced by
@@ -844,72 +1467,89 @@ function renderVarint(tagHtml, f, def) {
   if (def) {
     const t = def.type;
     if (t === PB_TYPE.BOOL) {
-      const v = u === 0n ? "false" : "true";
-      return `<li>${tagHtml} <span class="field-type">(bool)</span> = <span class="field-val-num">${v}</span></li>`;
+      const v = Number(u) === 0 ? "false" : "true";
+      return `<li>${tagHtml} <span class="field-type">(bool)</span> = <span class="field-val-num">${hl(v)}</span></li>`;
     }
     if (t === PB_TYPE.ENUM) {
       const enumDef = schema && schema.enums.get(def.typeName);
       const vDef = enumDef && enumDef.values.find((v) => v.number === Number(u));
       const name = vDef ? vDef.name : null;
-      const display = name ? `<span class="enum-name">${hl(name)}</span> <span class="field-type">(${u.toString()})</span>` : `<span class="field-val-num">${u.toString()}</span>`;
+      const display = name ? `<span class="enum-name">${hl(name)}</span> <span class="field-type">(${hl(u.toString())})</span>` : `<span class="field-val-num">${hl(u.toString())}</span>`;
       const enumLabel = enumDef ? hl(enumDef.name) : "enum";
       return `<li>${tagHtml} <span class="field-type">(${enumLabel})</span> = ${display}</li>`;
     }
     if (t === PB_TYPE.SINT32 || t === PB_TYPE.SINT64) {
       const z = zigzag(u);
-      return `<li>${tagHtml} <span class="field-type">(${typeLabel(t)})</span> = <span class="field-val-num">${z.toString()}</span></li>`;
+      return `<li>${tagHtml} <span class="field-type">(${typeLabel(t)})</span> = <span class="field-val-num">${hl(z.toString())}</span></li>`;
     }
     if (t === PB_TYPE.INT32 || t === PB_TYPE.INT64) {
       const signed = s64ToSigned(u);
-      return `<li>${tagHtml} <span class="field-type">(${typeLabel(t)})</span> = <span class="field-val-num">${signed.toString()}</span></li>`;
+      return `<li>${tagHtml} <span class="field-type">(${typeLabel(t)})</span> = <span class="field-val-num">${hl(signed.toString())}</span></li>`;
     }
     // UINT32, UINT64, or unknown
-    return `<li>${tagHtml} <span class="field-type">(${typeLabel(t)})</span> = <span class="field-val-num">${u.toString()}</span></li>`;
+    return `<li>${tagHtml} <span class="field-type">(${typeLabel(t)})</span> = <span class="field-val-num">${hl(u.toString())}</span></li>`;
   }
   // schema-less
   const z = zigzag(u);
-  return `<li>${tagHtml} <span class="field-type">(varint)</span> = <span class="field-val-num">${u.toString()}</span> <span class="field-type">zigzag=${z.toString()}</span></li>`;
+  return `<li>${tagHtml} <span class="field-type">(varint)</span> = <span class="field-val-num">${hl(u.toString())}</span> <span class="field-type">zigzag=${hl(z.toString())}</span></li>`;
 }
 
 function renderFixed(tagHtml, f, def, bits) {
   if (bits === 64) {
     const i = fixed64Interp(f.fixed);
     if (def) {
-      if (def.type === PB_TYPE.DOUBLE) return `<li>${tagHtml} <span class="field-type">(double)</span> = <span class="field-val-num">${escapeHtml(String(i.f64))}</span></li>`;
-      if (def.type === PB_TYPE.SFIXED64) return `<li>${tagHtml} <span class="field-type">(sfixed64)</span> = <span class="field-val-num">${i.i64}</span></li>`;
-      if (def.type === PB_TYPE.FIXED64) return `<li>${tagHtml} <span class="field-type">(fixed64)</span> = <span class="field-val-num">${i.u64}</span></li>`;
+      if (def.type === PB_TYPE.DOUBLE) return `<li>${tagHtml} <span class="field-type">(double)</span> = <span class="field-val-num">${hl(String(i.f64))}</span></li>`;
+      if (def.type === PB_TYPE.SFIXED64) return `<li>${tagHtml} <span class="field-type">(sfixed64)</span> = <span class="field-val-num">${hl(i.i64)}</span></li>`;
+      if (def.type === PB_TYPE.FIXED64) return `<li>${tagHtml} <span class="field-type">(fixed64)</span> = <span class="field-val-num">${hl(i.u64)}</span></li>`;
     }
-    return `<li>${tagHtml} <span class="field-type">(fixed64)</span> = <span class="field-val-num">u64=${i.u64}</span> <span class="field-type">i64=${i.i64} f64=${escapeHtml(String(i.f64))} hex=${i.hex}</span></li>`;
+    return `<li>${tagHtml} <span class="field-type">(fixed64)</span> = <span class="field-val-num">u64=${hl(i.u64)}</span> <span class="field-type">i64=${hl(i.i64)} f64=${hl(String(i.f64))} hex=${hl(i.hex)}</span></li>`;
   } else {
     const i = fixed32Interp(f.fixed);
     if (def) {
-      if (def.type === PB_TYPE.FLOAT) return `<li>${tagHtml} <span class="field-type">(float)</span> = <span class="field-val-num">${escapeHtml(String(i.f32))}</span></li>`;
-      if (def.type === PB_TYPE.SFIXED32) return `<li>${tagHtml} <span class="field-type">(sfixed32)</span> = <span class="field-val-num">${i.i32}</span></li>`;
-      if (def.type === PB_TYPE.FIXED32) return `<li>${tagHtml} <span class="field-type">(fixed32)</span> = <span class="field-val-num">${i.u32}</span></li>`;
+      if (def.type === PB_TYPE.FLOAT) return `<li>${tagHtml} <span class="field-type">(float)</span> = <span class="field-val-num">${hl(String(i.f32))}</span></li>`;
+      if (def.type === PB_TYPE.SFIXED32) return `<li>${tagHtml} <span class="field-type">(sfixed32)</span> = <span class="field-val-num">${hl(i.i32)}</span></li>`;
+      if (def.type === PB_TYPE.FIXED32) return `<li>${tagHtml} <span class="field-type">(fixed32)</span> = <span class="field-val-num">${hl(i.u32)}</span></li>`;
     }
-    return `<li>${tagHtml} <span class="field-type">(fixed32)</span> = <span class="field-val-num">u32=${i.u32}</span> <span class="field-type">i32=${i.i32} f32=${escapeHtml(String(i.f32))} hex=${i.hex}</span></li>`;
+    return `<li>${tagHtml} <span class="field-type">(fixed32)</span> = <span class="field-val-num">u32=${hl(i.u32)}</span> <span class="field-type">i32=${hl(i.i32)} f32=${hl(String(i.f32))} hex=${hl(i.hex)}</span></li>`;
   }
 }
 
 function detailsOpen(key, defaultOpen = true) {
+  // While a query is active the tree renders search-focused: defaults plus
+  // matching branches (nodeHit), nothing more. Honoring a full expand-all here
+  // meant rebuilding the entire open tree on every keystroke; the expanded
+  // state is kept and comes back as soon as the query clears.
+  if (searchQuery) return defaultOpen && !userCollapsed.has(key) ? "open" : "";
   if (defaultOpen) return userCollapsed.has(key) ? "" : "open";
   return userExpanded.has(key) ? "open" : "";
 }
 
-// During search we no longer blindly force every node open (that re-materialized
-// the whole tree on each keystroke and defeated lazy rendering). Instead a node
-// auto-opens only when its own bytes contain the query, so just the matching
-// branches — plus their siblings at each open level — get decoded and rendered.
-function bytesContainQuery(bytes) {
-  if (!searchQuery || !bytes || bytes.length === 0) return false;
-  const cap = 64 * 1024;
-  const slice = bytes.length > cap ? bytes.subarray(0, cap) : bytes;
-  try {
-    return new TextDecoder("utf-8", { fatal: false }).decode(slice).toLowerCase()
-      .includes(searchQuery.toLowerCase());
-  } catch {
-    return false;
+// Long strings render as a small window with a [full] toggle instead of
+// megabytes of text per row; the window re-centers on the first search match
+// so its mark stays visible. The whole string stays searchable (the index
+// holds all of it) and copyable (fullValues feeds the copy button).
+const STR_PREVIEW = 256;
+const fullValues = new Map(); // data-fk -> full string, rebuilt per render
+
+function strDisplay(s, key) {
+  const tKey = key + ":str";
+  const long = s.length > STR_PREVIEW;
+  if (!long || detailToggles[tKey] === "full") {
+    const toggle = long ? `<button class="toggle" data-key="${escapeHtml(tKey)}" data-to="">[trim]</button>` : "";
+    return { attr: "", html: hl(JSON.stringify(s)), toggle };
   }
+  let start = 0;
+  if (searchQuery) {
+    const at = s.toLowerCase().indexOf(searchQuery.toLowerCase());
+    if (at > STR_PREVIEW - 60) start = Math.max(0, at - 60);
+  }
+  const win = (start ? "…" : "") + s.slice(start, start + STR_PREVIEW) + "…";
+  fullValues.set(tKey, s);
+  return {
+    attr: ` data-fk="${escapeHtml(tKey)}"`,
+    html: hl(JSON.stringify(win)),
+    toggle: `<button class="toggle" data-key="${escapeHtml(tKey)}" data-to="full">[full]</button>`,
+  };
 }
 
 function renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs, depth) {
@@ -917,21 +1557,22 @@ function renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs, depth) {
   if (def) {
     if (def.type === PB_TYPE.STRING) {
       const s = (() => { try { return new TextDecoder("utf-8", { fatal: false }).decode(f.bytes); } catch { return null; } })();
-      return `<li>${tagHtml} <span class="field-type">(string, ${f.bytes.length} B)</span> = <span class="field-val-str">${hl(JSON.stringify(s ?? ""))}</span></li>`;
+      const sd = strDisplay(s ?? "", key);
+      return leafCopy(`<li>${tagHtml} <span class="field-type">(string, ${formatBytes(f.bytes.length)})</span>${sd.toggle} = <span class="field-val-str"${sd.attr}>${sd.html}</span></li>`);
     }
     if (def.type === PB_TYPE.BYTES) {
-      return `<li>${tagHtml} <span class="field-type">(bytes, ${f.bytes.length} B)</span> = <span class="field-val-hex">${bytesToHex(f.bytes, 64)}</span></li>`;
+      return leafCopy(`<li>${tagHtml} <span class="field-type">(bytes, ${formatBytes(f.bytes.length)})</span> = <span class="field-val-hex">${hl(bytesToHex(f.bytes, 64))}</span></li>`);
     }
     if (def.type === PB_TYPE.MESSAGE || def.type === PB_TYPE.GROUP) {
       const subDef = schema && schema.messages.get(def.typeName);
       const typeName = subDef ? subDef.name : (def.typeName || "message").replace(/^\./, "");
-      const label = `<span class="field-type">(${hl(typeName)}, ${f.bytes.length} B)</span>`;
+      const label = `<span class="field-type">(${hl(typeName)}, ${formatBytes(f.bytes.length)})</span>`;
       // Decode the sub-message only when this node is actually shown.
       return renderMessageNode(tagHtml, label, key,
-        () => renderFields(decodeMessage(f.bytes, false) || [], path, myCrumbs, subDef, depth + 1),
-        depth, bytesContainQuery(f.bytes));
+        () => renderFields(subFields(f), path, myCrumbs, subDef, depth + 1),
+        depth, nodeHit(f) && spendHit());
     }
-    return `<li>${tagHtml} <span class="field-type">(${typeLabel(def.type)} packed?, ${f.bytes.length} B)</span> = <span class="field-val-hex">${bytesToHex(f.bytes, 64)}</span></li>`;
+    return leafCopy(`<li>${tagHtml} <span class="field-type">(${typeLabel(def.type)} packed?, ${formatBytes(f.bytes.length)})</span> = <span class="field-val-hex">${hl(bytesToHex(f.bytes, 64))}</span></li>`);
   }
 
   // Schema-less fallback (heuristic with toggles)
@@ -940,27 +1581,28 @@ function renderLengthDelimited(tagHtml, f, def, key, path, myCrumbs, depth) {
   const showStr = detailToggles[key] === "str";
 
   if (f._nested && !showRaw && !showStr) {
-    const label = `<span class="field-type">(message, ${f.bytes.length} B)</span>`;
+    const label = `<span class="field-type">(message, ${formatBytes(f.bytes.length)})</span>`;
     const toggles = toggleLinks(key, ["str", "raw"]);
     return renderMessageNode(tagHtml, label + toggles, key,
       () => renderFields(f._nested, path, myCrumbs, null, depth + 1),
-      depth, bytesContainQuery(f.bytes));
+      depth, nodeHit(f) && spendHit());
   }
 
   let label, body, toggles;
   if (f._stringVal !== null && !showRaw) {
-    label = `<span class="field-type">(string, ${f.bytes.length} B)</span>`;
-    body = ` = <span class="field-val-str">${hl(JSON.stringify(f._stringVal))}</span>`;
-    toggles = toggleLinks(key, f._nested ? ["msg", "raw"] : ["raw"]);
+    const sd = strDisplay(f._stringVal, key);
+    label = `<span class="field-type">(string, ${formatBytes(f.bytes.length)})</span>`;
+    body = ` = <span class="field-val-str"${sd.attr}>${sd.html}</span>`;
+    toggles = toggleLinks(key, f._nested ? ["msg", "raw"] : ["raw"]) + sd.toggle;
   } else {
-    label = `<span class="field-type">(bytes, ${f.bytes.length} B)</span>`;
-    body = ` = <span class="field-val-hex">${bytesToHex(f.bytes, 48)}</span>`;
+    label = `<span class="field-type">(bytes, ${formatBytes(f.bytes.length)})</span>`;
+    body = ` = <span class="field-val-hex">${hl(bytesToHex(f.bytes, 48))}</span>`;
     const alts = [];
     if (f._nested) alts.push("msg");
     if (f._stringVal !== null) alts.push("str");
     toggles = toggleLinks(key, alts);
   }
-  return `<li>${tagHtml} ${label}${toggles}${body}</li>`;
+  return leafCopy(`<li>${tagHtml} ${label}${toggles}${body}</li>`);
 }
 
 const TOGGLE_TITLES = {
@@ -972,21 +1614,24 @@ const TOGGLE_TITLES = {
 function toggleLinks(key, alts) {
   if (alts.length === 0) return "";
   return alts.map((a) =>
-    `<span class="toggle" title="${escapeHtml(TOGGLE_TITLES[a] || "")}" data-key="${escapeHtml(key)}" data-to="${a === "msg" ? "" : a}">[${a}]</span>`
+    `<button class="toggle" title="${escapeHtml(TOGGLE_TITLES[a] || "")}" data-key="${escapeHtml(key)}" data-to="${a === "msg" ? "" : a}">[${a}]</button>`
   ).join("");
 }
 
 renderDetail();
 
-chrome.storage.local.get("schemaB64", (data) => {
+chrome.storage.local.get(["schemaB64", "schemaName"], (data) => {
   if (!data || !data.schemaB64) return;
   try {
     const bytes = base64ToBytes(data.schemaB64);
     const fileSet = parseFileDescriptorSet(bytes);
     schema = buildSchemaIndex(fileSet);
-    setSchemaStatus(`${schema.messages.size} msgs · ${schema.methods.size} RPCs`, "loaded");
+    invalidateSearch();
+    const name = data.schemaName || "schema";
+    setSchemaStatus(name, "loaded",
+      `${name} — ${schema.messages.size} messages, ${schema.methods.size} RPCs. Click to replace.`);
     renderDetail();
   } catch (e) {
-    setSchemaStatus("load failed: " + e.message, "error");
+    setSchemaStatus("schema error", "error", "load failed: " + e.message);
   }
 });
